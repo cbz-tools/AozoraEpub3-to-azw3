@@ -119,8 +119,6 @@ jobs:
           Copy-Item 'README.md', 'README.ja.md', 'LICENSE', 'CHANGELOG.md', 'THIRDPARTY_LICENSES.md' $stagingDir
           $archivePath = Join-Path $outputDir "$packageName.zip"
           Compress-Archive -Path (Join-Path $stagingDir '*') -DestinationPath $archivePath -Force
-          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash.ToLowerInvariant()
-          "$hash  $(Split-Path -Leaf $archivePath)" | Set-Content -Encoding ascii -NoNewline "$archivePath.sha256"
 
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $archive = [System.IO.Compression.ZipFile]::OpenRead($archivePath)
@@ -204,8 +202,6 @@ jobs:
           cp README.md README.ja.md LICENSE CHANGELOG.md THIRDPARTY_LICENSES.md "${staging_dir}/"
           archive_path="${output_dir}/${package_name}.tar.gz"
           tar -czf "${archive_path}" -C "${staging_dir}" AozoraEpub3-to-azw3 CHANGELOG.md LICENSE README.ja.md README.md THIRDPARTY_LICENSES.md
-          hash="$(shasum -a 256 "${archive_path}" | awk '{print $1}')"
-          printf '%s  %s\n' "${hash}" "$(basename "${archive_path}")" > "${archive_path}.sha256"
 
           expected="$(printf '%s\n' AozoraEpub3-to-azw3 CHANGELOG.md LICENSE README.ja.md README.md THIRDPARTY_LICENSES.md | sort)"
           actual="$(tar -tzf "${archive_path}" | sort)"
@@ -235,34 +231,27 @@ jobs:
         with:
           path: release-assets
           merge-multiple: true
-      - name: Verify release assets and checksums
+      - name: Verify release assets
         shell: bash
         run: |
           set -euo pipefail
           version='${{ needs.verify.outputs.version }}'
           expected="$(printf '%s\n' \
             "aozora-epub3-to-azw3-v${version}-windows-x64.zip" \
-            "aozora-epub3-to-azw3-v${version}-windows-x64.zip.sha256" \
             "aozora-epub3-to-azw3-v${version}-linux-x64.tar.gz" \
-            "aozora-epub3-to-azw3-v${version}-linux-x64.tar.gz.sha256" \
-            "aozora-epub3-to-azw3-v${version}-macos-arm64.tar.gz" \
-            "aozora-epub3-to-azw3-v${version}-macos-arm64.tar.gz.sha256" | sort)"
+            "aozora-epub3-to-azw3-v${version}-macos-arm64.tar.gz" | sort)"
           actual="$(find release-assets -maxdepth 1 -type f -printf '%f\n' | sort)"
           if [[ "${actual}" != "${expected}" ]]; then
             echo "::error::release asset allowlist mismatch"
             printf 'actual:\n%s\nexpected:\n%s\n' "${actual}" "${expected}"
             exit 1
           fi
-          for checksum in release-assets/*.sha256; do
-            (cd release-assets && sha256sum --check "$(basename "${checksum}")")
-          done
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           files: release-assets/*
           fail_on_unmatched_files: true
-          generate_release_notes: true
       - name: Publish crate to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
