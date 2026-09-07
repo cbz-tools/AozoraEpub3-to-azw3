@@ -1,0 +1,26 @@
+* text=auto
+
+*.rs   text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.ps1  text eol=lf
+*.sh   text eol=lf
+*.txt  text eol=lf
+*.lock text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+LICENSE* text eol=lf
+
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.ico  binary
+*.zip  binary
+*.epub binary
+*.azw3 binary
+*.mobi binary

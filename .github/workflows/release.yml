@@ -1,0 +1,258 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify tagged release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache Cargo registry and git sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: release-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-cargo-
+      - name: Verify tag matches Cargo package version
+        id: version
+        shell: bash
+        run: |
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          expected_tag="v${package_version}"
+          if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo package version ${package_version}"
+            exit 1
+          fi
+          echo "version=${package_version}" >> "${GITHUB_OUTPUT}"
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check compilation
+        run: cargo check --all-targets --all-features --locked
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Run tests
+        run: cargo test --all-features --locked
+      - name: Check public Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --locked
+      - name: Verify package contents
+        run: pwsh -File scripts/verify-package.ps1
+      - name: Check crates.io package
+        run: cargo publish --dry-run --locked
+
+  build-windows:
+    name: Build Windows x64
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo registry and git sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: windows-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: windows-release-cargo-
+      - name: Check compilation
+        run: cargo check --all-features --locked
+      - name: Run tests
+        run: cargo test --all-features --locked
+      - name: Build release binary
+        run: cargo build --release --all-features --locked
+      - name: Verify Windows VersionInfo
+        shell: pwsh
+        run: |
+          $expectedVersion = '${{ needs.verify.outputs.version }}'
+          $exePath = Join-Path $env:GITHUB_WORKSPACE 'target\release\AozoraEpub3-to-azw3.exe'
+          if (-not (Test-Path -LiteralPath $exePath)) {
+              throw "Windows release executable not found: $exePath"
+          }
+          $versionInfo = (Get-Item -LiteralPath $exePath).VersionInfo
+          if ($versionInfo.FileVersion -ne $expectedVersion) {
+              throw "FileVersion $($versionInfo.FileVersion) does not match $expectedVersion"
+          }
+          if ($versionInfo.ProductVersion -ne $expectedVersion) {
+              throw "ProductVersion $($versionInfo.ProductVersion) does not match $expectedVersion"
+          }
+          $versionInfo | Format-List FileVersion,ProductVersion,ProductName
+      - name: Package Windows release
+        shell: pwsh
+        run: |
+          $version = '${{ needs.verify.outputs.version }}'
+          $packageName = "aozora-epub3-to-azw3-v$version-windows-x64"
+          $outputDir = Join-Path $env:GITHUB_WORKSPACE 'target\release-package'
+          $stagingDir = Join-Path $env:RUNNER_TEMP $packageName
+          New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+          if (Test-Path -LiteralPath $stagingDir) {
+              Remove-Item -LiteralPath $stagingDir -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $stagingDir | Out-Null
+          Copy-Item 'target\release\AozoraEpub3-to-azw3.exe' $stagingDir
+          Copy-Item 'README.md', 'README.ja.md', 'LICENSE', 'CHANGELOG.md', 'THIRDPARTY_LICENSES.md' $stagingDir
+          $archivePath = Join-Path $outputDir "$packageName.zip"
+          Compress-Archive -Path (Join-Path $stagingDir '*') -DestinationPath $archivePath -Force
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path -Leaf $archivePath)" | Set-Content -Encoding ascii -NoNewline "$archivePath.sha256"
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($archivePath)
+          try {
+              $expected = @(
+                  'AozoraEpub3-to-azw3.exe',
+                  'CHANGELOG.md',
+                  'LICENSE',
+                  'README.ja.md',
+                  'README.md',
+                  'THIRDPARTY_LICENSES.md'
+              ) | Sort-Object
+              $actual = @($archive.Entries | ForEach-Object FullName | Sort-Object)
+              if (@(Compare-Object $expected $actual).Count -ne 0) {
+                  throw "Windows package contents differ from allowlist: $($actual -join ', ')"
+              }
+          }
+          finally {
+              $archive.Dispose()
+          }
+      - name: Upload Windows release package
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: target/release-package/*
+          if-no-files-found: error
+
+  build-unix:
+    name: Build ${{ matrix.platform }}
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: Linux x64
+            suffix: linux-x64
+            expected_arch: x86_64
+          - os: macos-latest
+            platform: macOS Apple Silicon
+            suffix: macos-arm64
+            expected_arch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo registry and git sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ matrix.suffix }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.suffix }}-release-cargo-
+      - name: Verify runner architecture
+        shell: bash
+        run: |
+          actual_arch="$(uname -m)"
+          echo "runner architecture: ${actual_arch}"
+          if [[ "${actual_arch}" != "${{ matrix.expected_arch }}" ]]; then
+            echo "::error::expected ${{ matrix.expected_arch }} but found ${actual_arch}"
+            exit 1
+          fi
+      - name: Check compilation
+        run: cargo check --all-features --locked
+      - name: Run tests
+        run: cargo test --all-features --locked
+      - name: Build release binary
+        run: cargo build --release --all-features --locked
+      - name: Package Unix release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version='${{ needs.verify.outputs.version }}'
+          package_name="aozora-epub3-to-azw3-v${version}-${{ matrix.suffix }}"
+          output_dir="${GITHUB_WORKSPACE}/target/release-package"
+          staging_dir="${RUNNER_TEMP}/${package_name}"
+          rm -rf "${staging_dir}" "${output_dir}"
+          mkdir -p "${output_dir}" "${staging_dir}"
+          cp target/release/AozoraEpub3-to-azw3 "${staging_dir}/"
+          cp README.md README.ja.md LICENSE CHANGELOG.md THIRDPARTY_LICENSES.md "${staging_dir}/"
+          archive_path="${output_dir}/${package_name}.tar.gz"
+          tar -czf "${archive_path}" -C "${staging_dir}" AozoraEpub3-to-azw3 CHANGELOG.md LICENSE README.ja.md README.md THIRDPARTY_LICENSES.md
+          hash="$(shasum -a 256 "${archive_path}" | awk '{print $1}')"
+          printf '%s  %s\n' "${hash}" "$(basename "${archive_path}")" > "${archive_path}.sha256"
+
+          expected="$(printf '%s\n' AozoraEpub3-to-azw3 CHANGELOG.md LICENSE README.ja.md README.md THIRDPARTY_LICENSES.md | sort)"
+          actual="$(tar -tzf "${archive_path}" | sort)"
+          if [[ "${actual}" != "${expected}" ]]; then
+            echo "::error::${package_name} contents differ from allowlist"
+            printf 'actual:\n%s\nexpected:\n%s\n' "${actual}" "${expected}"
+            exit 1
+          fi
+      - name: Upload Unix release package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.suffix }}
+          path: target/release-package/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [verify, build-windows, build-unix]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Download release packages
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Verify release assets and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          version='${{ needs.verify.outputs.version }}'
+          expected="$(printf '%s\n' \
+            "aozora-epub3-to-azw3-v${version}-windows-x64.zip" \
+            "aozora-epub3-to-azw3-v${version}-windows-x64.zip.sha256" \
+            "aozora-epub3-to-azw3-v${version}-linux-x64.tar.gz" \
+            "aozora-epub3-to-azw3-v${version}-linux-x64.tar.gz.sha256" \
+            "aozora-epub3-to-azw3-v${version}-macos-arm64.tar.gz" \
+            "aozora-epub3-to-azw3-v${version}-macos-arm64.tar.gz.sha256" | sort)"
+          actual="$(find release-assets -maxdepth 1 -type f -printf '%f\n' | sort)"
+          if [[ "${actual}" != "${expected}" ]]; then
+            echo "::error::release asset allowlist mismatch"
+            printf 'actual:\n%s\nexpected:\n%s\n' "${actual}" "${expected}"
+            exit 1
+          fi
+          for checksum in release-assets/*.sha256; do
+            (cd release-assets && sha256sum --check "$(basename "${checksum}")")
+          done
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: release-assets/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+      - name: Publish crate to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked

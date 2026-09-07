@@ -1,0 +1,13 @@
+/*
+ * E-12 embedded-font fixture.
+ * Stage this as AozoraEpub3's enabled vertical_font.css when generating
+ * the fixture EPUB, and stage EBGaramond12-Bold.ttf under template/fonts/.
+ */
+@font-face {
+    font-family: "E12FixtureFont";
+    src: url(../fonts/EBGaramond12-Bold.ttf);
+}
+
+body {
+    font-family: "E12FixtureFont";
+}

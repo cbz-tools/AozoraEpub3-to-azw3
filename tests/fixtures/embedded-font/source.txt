@@ -1,0 +1,11 @@
+E-12 Embedded Font Fixture
+AozoraEpub3-to-azw3
+
+［＃改ページ］
+［＃大見出し］E-12 Embedded Font［＃大見出し終わり］
+
+　この章は埋め込みTTF resourceのKF8/AZW3変換確認専用である。
+
+E12 FONT TEST ABC123
+
+　上の英数字は埋め込みフォントを適用する確認文字列である。

@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Stable quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache Cargo registry and git sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: quality-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: quality-cargo-
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check compilation
+        run: cargo check --all-targets --all-features --locked
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Run tests
+        run: cargo test --all-features --locked
+      - name: Check public Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --locked
+      - name: Verify package contents
+        run: pwsh -File scripts/verify-package.ps1
+      - name: Check crates.io package
+        run: cargo publish --dry-run --locked
+
+  platform:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo registry and git sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.os }}-cargo-
+      - name: Check compilation
+        run: cargo check --all-features --locked
+      - name: Run tests
+        run: cargo test --all-features --locked
+      - name: Build release binary
+        run: cargo build --release --all-features --locked
+
+  rust-1-85:
+    name: Ubuntu Rust 1.85
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - name: Check compilation
+        run: cargo check --all-features --locked
+      - name: Run tests
+        run: cargo test --all-features --locked

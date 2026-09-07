@@ -1,0 +1,305 @@
+//! Parse NCX and EPUB 3 navigation into common navigation semantics.
+//!
+//! This module absorbs source-format differences and canonicalizes navigation
+//! targets; KF8 INDX/CTOC serialization remains in `kf8::ncx`.
+
+use std::io::Cursor;
+use std::path::Path;
+
+use quick_xml::Reader;
+use quick_xml::events::{BytesStart, Event};
+
+use super::opf::{ManifestItem, attr, local_name};
+use super::package::resolve_href;
+use crate::book::{Navigation, NavigationItem, NavigationLandmark, plain_display_text};
+use crate::error::{Error, Result};
+pub(super) fn parse_ncx(xml: &[u8]) -> Result<Navigation> {
+    let mut reader = Reader::from_reader(Cursor::new(xml));
+    reader.config_mut().trim_text(true);
+    let mut buffer = Vec::new();
+    let mut navigation = Navigation::default();
+    let mut stack: Vec<NavigationItem> = Vec::new();
+    let mut current_text = None;
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(event) => {
+                let name = local_name(event.name().as_ref());
+                if name == "navpoint" {
+                    stack.push(NavigationItem::default());
+                }
+                if name == "text" {
+                    current_text = Some(String::new());
+                }
+                if name == "img" {
+                    if let (Some(current_text), Some(alt)) =
+                        (current_text.as_mut(), attr(&event, "alt"))
+                    {
+                        current_text.push_str(&alt);
+                    }
+                }
+                if name == "content" {
+                    if let Some(item) = stack.last_mut() {
+                        item.href = attr(&event, "src").unwrap_or_default();
+                    }
+                }
+            }
+            Event::Empty(event) if local_name(event.name().as_ref()) == "content" => {
+                if let Some(item) = stack.last_mut() {
+                    item.href = attr(&event, "src").unwrap_or_default();
+                }
+            }
+            Event::Empty(event) if local_name(event.name().as_ref()) == "img" => {
+                if let (Some(current_text), Some(alt)) =
+                    (current_text.as_mut(), attr(&event, "alt"))
+                {
+                    current_text.push_str(&alt);
+                }
+            }
+            Event::Text(event) => {
+                if let Some(current_text) = current_text.as_mut() {
+                    current_text.push_str(
+                        &event
+                            .unescape()
+                            .map_err(|error| Error::Xml(error.to_string()))?,
+                    );
+                }
+            }
+            Event::CData(event) => {
+                if let Some(current_text) = current_text.as_mut() {
+                    current_text.push_str(&String::from_utf8_lossy(event.as_ref()));
+                }
+            }
+            Event::End(event) => {
+                let name = local_name(event.name().as_ref());
+                if name == "text" {
+                    if let Some(item) = stack.last_mut() {
+                        item.label =
+                            plain_display_text(current_text.take().as_deref().unwrap_or_default());
+                    }
+                }
+                if name == "navpoint" {
+                    if let Some(item) = stack.pop() {
+                        if let Some(parent) = stack.last_mut() {
+                            parent.children.push(item);
+                        } else {
+                            navigation.items.push(item);
+                        }
+                    }
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    Ok(navigation)
+}
+
+pub(super) fn parse_nav_xhtml(xml: &[u8]) -> Result<Navigation> {
+    let mut reader = Reader::from_reader(Cursor::new(xml));
+    reader.config_mut().trim_text(true);
+    let mut buffer = Vec::new();
+    let mut navigation = Navigation::default();
+    let mut current_anchor: Option<(NavigationItem, Option<String>)> = None;
+    let mut list_items: Vec<(NavigationItem, Option<String>)> = Vec::new();
+    let mut nav_stack: Vec<Option<String>> = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(event) if local_name(event.name().as_ref()) == "nav" => {
+                nav_stack.push(nav_kind(&event));
+            }
+            Event::Start(event) if local_name(event.name().as_ref()) == "li" => {
+                if !nav_stack.is_empty() {
+                    list_items.push((NavigationItem::default(), None));
+                }
+            }
+            Event::Start(event) if local_name(event.name().as_ref()) == "a" => {
+                let kind = attr(&event, "type").or_else(|| attr(&event, "role"));
+                current_anchor = Some((
+                    NavigationItem {
+                        href: attr(&event, "href").unwrap_or_default(),
+                        ..NavigationItem::default()
+                    },
+                    kind,
+                ));
+            }
+            Event::Text(event) => {
+                if let Some((item, _)) = current_anchor.as_mut() {
+                    item.label.push_str(
+                        &event
+                            .unescape()
+                            .map_err(|error| Error::Xml(error.to_string()))?,
+                    );
+                }
+            }
+            Event::Empty(event) if local_name(event.name().as_ref()) == "img" => {
+                if let Some((item, _)) = current_anchor.as_mut() {
+                    if let Some(alt) = attr(&event, "alt") {
+                        item.label.push_str(&alt);
+                    }
+                }
+            }
+            Event::CData(event) => {
+                if let Some((item, _)) = current_anchor.as_mut() {
+                    item.label
+                        .push_str(&String::from_utf8_lossy(event.as_ref()));
+                }
+            }
+            Event::End(event) if local_name(event.name().as_ref()) == "a" => {
+                if let Some((mut item, anchor_kind)) = current_anchor.take() {
+                    item.label = plain_display_text(&item.label);
+                    if let Some((list_item, list_anchor_kind)) = list_items.last_mut() {
+                        list_item.href = item.href;
+                        list_item.label = item.label;
+                        *list_anchor_kind = anchor_kind;
+                    } else {
+                        append_nav_item(
+                            &mut navigation,
+                            item,
+                            anchor_kind,
+                            nav_stack.last().and_then(Clone::clone),
+                        );
+                    }
+                }
+            }
+            Event::End(event) if local_name(event.name().as_ref()) == "li" => {
+                if let Some((item, anchor_kind)) = list_items.pop() {
+                    if let Some((parent, _)) = list_items.last_mut() {
+                        parent.children.push(item);
+                    } else {
+                        append_nav_item(
+                            &mut navigation,
+                            item,
+                            anchor_kind,
+                            nav_stack.last().and_then(Clone::clone),
+                        );
+                    }
+                }
+            }
+            Event::End(event) if local_name(event.name().as_ref()) == "nav" => {
+                nav_stack.pop();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    Ok(navigation)
+}
+
+fn append_nav_item(
+    navigation: &mut Navigation,
+    item: NavigationItem,
+    anchor_kind: Option<String>,
+    nav_kind: Option<String>,
+) {
+    if nav_kind
+        .as_deref()
+        .is_some_and(|kind| has_token(kind, "landmarks"))
+    {
+        let kind = anchor_kind.unwrap_or_default();
+        navigation.landmarks.push(NavigationLandmark {
+            kind: normalize_landmark_kind(&kind),
+            label: item.label,
+            href: item.href,
+        });
+    } else {
+        navigation.items.push(item);
+    }
+}
+
+fn nav_kind(event: &BytesStart<'_>) -> Option<String> {
+    attr(event, "type").or_else(|| attr(event, "role"))
+}
+
+pub(super) fn has_token(value: &str, token: &str) -> bool {
+    value
+        .split_whitespace()
+        .any(|part| part.eq_ignore_ascii_case(token))
+}
+
+fn normalize_landmark_kind(value: &str) -> String {
+    if has_token(value, "cover") {
+        return "cover".to_owned();
+    }
+    value
+        .split_whitespace()
+        .find(|part| {
+            matches!(
+                part.to_ascii_lowercase().as_str(),
+                "text" | "body" | "bodymatter" | "start" | "titlepage" | "title-page" | "toc"
+            )
+        })
+        .map(|part| match part.to_ascii_lowercase().as_str() {
+            "bodymatter" | "body" => "text".to_owned(),
+            "title-page" => "titlepage".to_owned(),
+            value => value.to_owned(),
+        })
+        .unwrap_or_default()
+}
+
+pub(super) fn canonicalize_navigation(
+    navigation: &mut Navigation,
+    navigation_path: &str,
+    opf_base: &Path,
+    manifest: &[ManifestItem],
+) {
+    let navigation_base = Path::new(navigation_path)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    for item in &mut navigation.items {
+        canonicalize_navigation_item(item, navigation_base, opf_base, manifest);
+    }
+    for landmark in &mut navigation.landmarks {
+        let (target_path, suffix) = split_link_suffix(&landmark.href);
+        if !target_path.is_empty() {
+            let resolved_target = resolve_href(navigation_base, target_path);
+            if let Some(manifest_item) = manifest.iter().find(|candidate| {
+                (candidate
+                    .media_type
+                    .eq_ignore_ascii_case("application/xhtml+xml")
+                    || candidate.media_type.eq_ignore_ascii_case("text/html"))
+                    && resolve_href(opf_base, &candidate.href) == resolved_target
+            }) {
+                landmark.href = format!("{}{}", manifest_item.href, suffix);
+            } else {
+                landmark.href = format!("{}{}", resolved_target, suffix);
+            }
+        }
+    }
+}
+
+fn canonicalize_navigation_item(
+    item: &mut NavigationItem,
+    navigation_base: &Path,
+    opf_base: &Path,
+    manifest: &[ManifestItem],
+) {
+    let (target_path, suffix) = split_link_suffix(&item.href);
+    if !target_path.is_empty() {
+        let resolved_target = resolve_href(navigation_base, target_path);
+        if let Some(manifest_item) = manifest.iter().find(|candidate| {
+            (candidate
+                .media_type
+                .eq_ignore_ascii_case("application/xhtml+xml")
+                || candidate.media_type.eq_ignore_ascii_case("text/html"))
+                && resolve_href(opf_base, &candidate.href) == resolved_target
+        }) {
+            // Keep the manifest spelling, including case, as the Book IR's
+            // canonical document name. Only the navigation source-relative
+            // prefix is normalized here.
+            item.href = format!("{}{}", manifest_item.href, suffix);
+        } else {
+            item.href = format!("{}{}", resolved_target, suffix);
+        }
+    }
+    for child in &mut item.children {
+        canonicalize_navigation_item(child, navigation_base, opf_base, manifest);
+    }
+}
+
+pub(super) fn split_link_suffix(href: &str) -> (&str, &str) {
+    href.find(['#', '?'])
+        .map(|index| (&href[..index], &href[index..]))
+        .unwrap_or((href, ""))
+}
