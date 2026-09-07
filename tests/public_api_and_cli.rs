@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use aozora_epub3_to_azw3::{Compression, ConvertOptions, convert_bytes, convert_file};
+use aozoraepub3_to_azw3::{Compression, ConvertOptions, convert_bytes, convert_file};
 
 fn fixture() -> Vec<u8> {
     let path = "tests/fixtures/public-api-and-cli/source.epub";

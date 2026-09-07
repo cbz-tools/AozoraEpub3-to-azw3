@@ -29,7 +29,7 @@ KF8-only AZW3へ変換するRustライブラリおよびCLIです。
 Rust 1.85以降が必要です。
 
 ```bash
-cargo install aozora_epub3_to_azw3
+cargo install aozoraepub3-to-azw3
 ```
 
 ## スクリーンショット
@@ -126,7 +126,7 @@ AozoraEpub3-to-azw3 <input.epub> [-o <output.azw3>] [-c0 | -c1] [-verbose]
 ## ライブラリ
 
 ```rust
-use aozora_epub3_to_azw3::{convert_bytes, Compression, ConvertOptions};
+use aozoraepub3_to_azw3::{convert_bytes, Compression, ConvertOptions};
 
 let azw3 = convert_bytes(
     &epub_bytes,

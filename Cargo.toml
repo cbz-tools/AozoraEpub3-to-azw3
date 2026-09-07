@@ -1,5 +1,5 @@
 [package]
-name = "aozora_epub3_to_azw3"
+name = "aozoraepub3-to-azw3"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
@@ -23,7 +23,7 @@ include = [
 ]
 
 [lib]
-name = "aozora_epub3_to_azw3"
+name = "aozoraepub3_to_azw3"
 path = "src/lib.rs"
 
 [[bin]]

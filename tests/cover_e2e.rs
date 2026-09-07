@@ -1,6 +1,6 @@
 mod support;
 
-use aozora_epub3_to_azw3::{ConvertOptions, convert_bytes};
+use aozoraepub3_to_azw3::{ConvertOptions, convert_bytes};
 use image::ImageReader;
 use std::io::{Cursor, Read};
 use support::{

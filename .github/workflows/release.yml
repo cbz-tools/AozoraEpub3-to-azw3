@@ -55,9 +55,20 @@ jobs:
       - name: Check crates.io package
         run: cargo publish --dry-run --locked
 
+  verify-msrv:
+    name: Verify Rust 1.85 compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - name: Check compilation with Rust 1.85
+        run: cargo check --all-targets --all-features --locked
+      - name: Run tests with Rust 1.85
+        run: cargo test --all-targets --all-features --locked
+
   build-windows:
     name: Build Windows x64
-    needs: verify
+    needs: [verify, verify-msrv]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -139,7 +150,7 @@ jobs:
 
   build-unix:
     name: Build ${{ matrix.platform }}
-    needs: verify
+    needs: [verify, verify-msrv]
     strategy:
       fail-fast: false
       matrix:
@@ -212,7 +223,7 @@ jobs:
 
   publish:
     name: Publish release
-    needs: [verify, build-windows, build-unix]
+    needs: [verify, verify-msrv, build-windows, build-unix]
     runs-on: ubuntu-latest
     permissions:
       contents: write

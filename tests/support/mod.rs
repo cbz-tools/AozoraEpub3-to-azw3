@@ -2,7 +2,7 @@
 
 use std::io::{Cursor, Write};
 
-use aozora_epub3_to_azw3::{Compression, ConvertOptions, convert_bytes};
+use aozoraepub3_to_azw3::{Compression, ConvertOptions, convert_bytes};
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;

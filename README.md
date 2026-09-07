@@ -34,7 +34,7 @@ Extract the archive and run `AozoraEpub3-to-azw3` directly.
 Requires Rust 1.85 or newer.
 
 ```bash
-cargo install aozora_epub3_to_azw3
+cargo install aozoraepub3-to-azw3
 ```
 
 ## Screenshots
@@ -149,7 +149,7 @@ replaced with `.azw3`.
 ## Library
 
 ```rust
-use aozora_epub3_to_azw3::{convert_bytes, Compression, ConvertOptions};
+use aozoraepub3_to_azw3::{convert_bytes, Compression, ConvertOptions};
 
 let azw3 = convert_bytes(
     &epub_bytes,

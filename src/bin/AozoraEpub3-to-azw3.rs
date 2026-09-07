@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use aozora_epub3_to_azw3::{Compression, ConvertOptions, convert_file};
+use aozoraepub3_to_azw3::{Compression, ConvertOptions, convert_file};
 
 fn usage() -> &'static str {
     "Usage: AozoraEpub3-to-azw3 <input.epub> [-o <output.azw3>] [-c0 | -c1] [-verbose] [-dont_append_source] [-donotaddsource]"

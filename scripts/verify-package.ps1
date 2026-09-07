@@ -1,6 +1,7 @@
 $ErrorActionPreference = 'Stop'
-$crateName = 'aozora_epub3_to_azw3'
+$crateName = 'aozoraepub3-to-azw3'
 $version = (Select-String -LiteralPath 'Cargo.toml' -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+$directorySeparator = [string][System.IO.Path]::DirectorySeparatorChar
 $forbidden = 'sovereign_stars_vol_1.epub', 'sovereign_stars_vol_1_cover.png', 'sovereign_stars_vol_1_page_001.png', 'sovereign_stars_vol_1_page_002.png', 'sovereign_stars_vol_1.txt', 'target/'
 $required = @(
     'README.md',
@@ -34,27 +35,35 @@ New-Item -ItemType Directory -Path $root | Out-Null
 tar -xf $crate -C $root
 $extracted = Join-Path $root "$crateName-$version"
 if (-not (Test-Path -LiteralPath $extracted)) { throw "extracted crate not found: $extracted" }
-$extractedRoot = [System.IO.Path]::GetFullPath($extracted).TrimEnd('\') + '\'
+$extractedRoot = [System.IO.Path]::GetFullPath($extracted)
 foreach ($readmeName in @('README.md', 'README.ja.md')) {
     $readmePath = Join-Path $extracted $readmeName
     $markdown = Get-Content -Raw -LiteralPath $readmePath
     $links = [regex]::Matches($markdown, '\]\(([^)\s]+)') |
         ForEach-Object { $_.Groups[1].Value } |
-        Where-Object {
-            $linkPath = $_.Split('#')[0].Replace('/', '\\')
-            -not $linkPath.StartsWith('docs\\', [System.StringComparison]::OrdinalIgnoreCase)
-        } |
         Select-Object -Unique
     foreach ($link in $links) {
-        if ($link.StartsWith('#') -or $link -match '^[A-Za-z][A-Za-z0-9+.-]*:') {
+        if ($link.StartsWith('#')) {
             continue
         }
-        $linkPath = $link.Split('#')[0]
-        $resolved = [System.IO.Path]::GetFullPath(
-            (Join-Path $extracted ($linkPath -replace '/', '\'))
-        )
-        if (-not $resolved.StartsWith($extractedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $linkPath = $link.Split('#')[0].Replace('/', $directorySeparator).Replace('\', $directorySeparator)
+        if ($link -match '^https?://') {
+            continue
+        }
+        if ($link -match '^[A-Za-z][A-Za-z0-9+.-]*:') {
+            throw "README link uses an unsupported URI scheme: $readmeName -> $link"
+        }
+        if ([System.IO.Path]::IsPathRooted($linkPath)) {
+            throw "README link uses an absolute filesystem path: $readmeName -> $link"
+        }
+        $resolved = [System.IO.Path]::GetFullPath($linkPath, $extractedRoot)
+        $relative = [System.IO.Path]::GetRelativePath($extractedRoot, $resolved)
+        $parentPrefix = "..$directorySeparator"
+        if ($relative -eq '..' -or $relative.StartsWith($parentPrefix, [System.StringComparison]::Ordinal)) {
             throw "README link escapes extracted crate: $readmeName -> $link"
+        }
+        if ($linkPath.StartsWith("docs$directorySeparator", [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue
         }
         if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
             throw "README link does not resolve in extracted crate: $readmeName -> $link"

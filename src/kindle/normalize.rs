@@ -135,11 +135,10 @@ pub(crate) fn normalize(book: Book) -> KindleBook {
                 && !sections
                     .iter()
                     .any(|section| document_path(&section.href) == target_path);
-            if is_bodymatter_landmark(&landmark.kind)
-                && target_is_omitted_cover
-                && let Some(fallback_body_href) = fallback_body_href.as_ref()
-            {
-                landmark.href = fallback_body_href.clone();
+            if is_bodymatter_landmark(&landmark.kind) && target_is_omitted_cover {
+                if let Some(fallback_body_href) = fallback_body_href.as_ref() {
+                    landmark.href = fallback_body_href.clone();
+                }
             }
             landmark
         })

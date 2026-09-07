@@ -206,12 +206,12 @@ impl PalmDocCompressor {
                 let mut match_length = 0usize;
                 for length in (3..=10).rev() {
                     let hash = Self::hash(source, cursor, length);
-                    if let Some(position) = self.find(source, cursor, length, hash)
-                        && cursor - position <= 2047
-                    {
-                        match_position = Some(position);
-                        match_length = length;
-                        break;
+                    if let Some(position) = self.find(source, cursor, length, hash) {
+                        if cursor - position <= 2047 {
+                            match_position = Some(position);
+                            match_length = length;
+                            break;
+                        }
                     }
                 }
                 if let Some(position) = match_position {

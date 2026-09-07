@@ -316,10 +316,12 @@ fn source_cover_image_resource(markup: &str) -> (String, String) {
                 if properties
                     .split_whitespace()
                     .any(|property| property.eq_ignore_ascii_case("cover-image"))
-                    && let (Some(href), Some(media_type)) =
-                        (attribute(&event, "href"), attribute(&event, "media-type"))
                 {
-                    resources.push((href, media_type));
+                    if let (Some(href), Some(media_type)) =
+                        (attribute(&event, "href"), attribute(&event, "media-type"))
+                    {
+                        resources.push((href, media_type));
+                    }
                 }
             }
             Event::Eof => break,
