@@ -486,6 +486,33 @@ Physical Kindle Device Evidence = 13 / 13 CONFIRMED PASS
 Known Physical Kindle failures attributable to self conversion = 0
 ```
 
+
+## Supplemental device observation — Amazon ASIN cover fetch
+
+The following is a supplemental Physical Kindle observation only. It is not
+part of the mandatory A–F semantic contract, Layer L 13/13 acceptance count,
+or release acceptance criteria.
+
+On a Kindle Oasis, a sideloaded KF8/AZW3 containing:
+
+```text
+EXTH 113 = a valid Amazon Kindle ASIN
+EXTH 501 = EBOK
+EXTH 504 = the same ASIN
+```
+
+displayed the Amazon product's official library cover after Wi-Fi was enabled.
+
+For the diagnostic run, the AZW3 body content was `Sovereign Stars Vol. 1`,
+while the embedded ASIN identified an unrelated Amazon Kindle title. The
+library cover changed to that unrelated title's Amazon cover, providing device
+evidence that the displayed library thumbnail was obtained through Amazon ASIN
+metadata/cover lookup rather than from the AZW3's embedded cover resource.
+
+This observation is retained for diagnostic/reference purposes only. The
+converter does not currently require, synthesize, or guarantee Amazon ASIN
+metadata for library-cover behavior.
+
 ---
 
 # 12. Release Acceptance Criteria
