@@ -107,7 +107,7 @@ jobs:
         shell: pwsh
         run: |
           $version = '${{ needs.verify.outputs.version }}'
-          $packageName = "aozora-epub3-to-azw3-v$version-windows-x64"
+          $packageName = "aozoraepub3-to-azw3-v$version-windows-x64"
           $outputDir = Join-Path $env:GITHUB_WORKSPACE 'target\release-package'
           $stagingDir = Join-Path $env:RUNNER_TEMP $packageName
           New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
@@ -193,7 +193,7 @@ jobs:
         run: |
           set -euo pipefail
           version='${{ needs.verify.outputs.version }}'
-          package_name="aozora-epub3-to-azw3-v${version}-${{ matrix.suffix }}"
+          package_name="aozoraepub3-to-azw3-v${version}-${{ matrix.suffix }}"
           output_dir="${GITHUB_WORKSPACE}/target/release-package"
           staging_dir="${RUNNER_TEMP}/${package_name}"
           rm -rf "${staging_dir}" "${output_dir}"
@@ -237,9 +237,9 @@ jobs:
           set -euo pipefail
           version='${{ needs.verify.outputs.version }}'
           expected="$(printf '%s\n' \
-            "aozora-epub3-to-azw3-v${version}-windows-x64.zip" \
-            "aozora-epub3-to-azw3-v${version}-linux-x64.tar.gz" \
-            "aozora-epub3-to-azw3-v${version}-macos-arm64.tar.gz" | sort)"
+            "aozoraepub3-to-azw3-v${version}-windows-x64.zip" \
+            "aozoraepub3-to-azw3-v${version}-linux-x64.tar.gz" \
+            "aozoraepub3-to-azw3-v${version}-macos-arm64.tar.gz" | sort)"
           actual="$(find release-assets -maxdepth 1 -type f -printf '%f\n' | sort)"
           if [[ "${actual}" != "${expected}" ]]; then
             echo "::error::release asset allowlist mismatch"

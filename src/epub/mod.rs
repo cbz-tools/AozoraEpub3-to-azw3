@@ -1,4 +1,5 @@
 mod css;
+mod font_obfuscation;
 mod navigation;
 mod opf;
 mod package;

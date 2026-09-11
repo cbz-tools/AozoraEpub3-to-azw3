@@ -1,17 +1,20 @@
-mod support;
+//! Extended-scope primary audit coverage: A-17b..A-17f, B-08..B-10, B-12,
+//! C-05..C-11, C-13, E-14. B-11, B-13, and B-14 remain diagnostic boundaries.
 
+use crate::support::{FixedLayoutDeclaration, convert_epub, fixed_layout_comic_recipe};
 use image::GenericImageView;
 use quick_xml::events::Event;
 use quick_xml::name::{Namespace, ResolveResult};
 use quick_xml::reader::NsReader;
 use std::io::{Cursor, Read};
-use support::{FixedLayoutDeclaration, convert_epub, fixed_layout_comic_recipe};
 use zip::ZipArchive;
 
+// E2E-ID: E2E-FXL-02
+// Audit: G6-17; A-17b..A-17e, B-08..B-10, B-12, C-05..C-11, C-13, E-14
 #[test]
 fn fixed_layout_page_images_use_secondary_svg_flows() {
-    // EXTENDED SCOPE: A-17*, B-08..B-10, B-12, C-05..C-13, E-14. This does
-    // not claim KindleGen numeric parity for EXTH 125 or DATP, nor device
+    // Audit coverage (EXTENDED SCOPE): A-17b..A-17e, B-08..B-10, B-12,
+    // C-05..C-11, C-13, E-14. This does not claim B-11/D-13 diagnostic parity, nor device
     // acceptance or renderer capability.
     let epub = fixed_layout_comic_recipe(FixedLayoutDeclaration::FixedLayoutTrue);
     let mut archive = ZipArchive::new(Cursor::new(&epub)).expect("comic fixture ZIP");

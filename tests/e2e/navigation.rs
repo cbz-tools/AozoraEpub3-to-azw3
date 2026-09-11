@@ -1,11 +1,14 @@
-mod support;
+//! Primary audit coverage: A-04, A-06..A-08, A-12, D-06..D-08,
+//! F-06, F-10..F-12.
 
-use support::{NavigationRecipe, convert_epub, navigation_recipe};
+use crate::support::{NavigationRecipe, convert_epub, navigation_recipe};
 
+// E2E-ID: E2E-NAV-01
+// Audit: G2-03, G3-14, G3-15; A-04, A-06..A-08, A-12..A-13, D-06..D-08, F-06, F-10..F-12, F-14
 #[test]
 fn navigation_sources_preserve_visible_toc_and_reading_order() {
-    // Audit coverage: A-04, A-06, A-07, A-08, A-12; D-06..D-08;
-    // F-06, F-10..F-12 and supported body-link/resource contracts.
+    // Audit coverage: A-04, A-06, A-07, A-08, A-12, A-13; D-06..D-08;
+    // F-06, F-10..F-12, F-14 and supported body-link/resource contracts.
     for recipe in [
         NavigationRecipe::InSpine,
         NavigationRecipe::OutsideSpine,
@@ -87,8 +90,11 @@ fn navigation_sources_preserve_visible_toc_and_reading_order() {
     }
 }
 
+// E2E-ID: E2E-NAV-02
+// Audit: G2-03; A-04, A-12, B-18, D-08, F-06, F-12
 #[test]
 fn linear_no_navigation_item_is_retained_without_becoming_bodymatter() {
+    // Audit coverage: A-04, A-12, B-18, D-08, F-06, F-12.
     // The source nav is intentionally a non-linear spine item. It remains a
     // visible navigation section, while the Guide body target remains body.
     let azw3 = convert_epub(navigation_recipe(NavigationRecipe::LinearNo));

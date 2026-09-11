@@ -18,6 +18,12 @@ pub struct ContentDocument {
     /// Effective source rendition layout resolved from the OPF spine itemref
     /// and publication-level rendition metadata.
     pub layout: LayoutSemantic,
+    pub rendition: crate::book::RenditionSemantics,
+    /// Original EPUB spine itemref properties, including page-spread aliases.
+    pub source_properties: Vec<String>,
+    /// Zero-based source spine position used to relate this document to the
+    /// emitted Kindle section/SKEL topology.
+    pub source_spine_index: usize,
     /// Whether the source document was classified as a cover during EPUB
     /// parsing. The detailed semantic parse is intentionally short-lived in
     /// the conversion pipeline; retaining it here duplicates large text and

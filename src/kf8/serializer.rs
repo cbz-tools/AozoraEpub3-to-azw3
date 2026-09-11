@@ -40,6 +40,7 @@ fn serialized_records(book: super::Kf8Book) -> Result<(Vec<u8>, Vec<Kf8Record>)>
         mut mobi,
         exth,
         title,
+        resc_record,
         records,
     } = book;
     let exth = exth.encode_checked()?;
@@ -63,6 +64,18 @@ fn serialized_records(book: super::Kf8Book) -> Result<(Vec<u8>, Vec<Kf8Record>)>
         ));
     }
     mobi.validate_for_record_count(record_count)?;
+    let resc_index = resc_record
+        .checked_sub(1)
+        .ok_or_else(|| crate::error::Error::Output("RESC record index is zero".to_owned()))?
+        as usize;
+    if records
+        .get(resc_index)
+        .is_none_or(|record| !record.data.starts_with(b"RESC"))
+    {
+        return Err(crate::error::Error::Output(
+            "RESC record index does not identify a RESC record".to_owned(),
+        ));
+    }
     Ok((header, records))
 }
 

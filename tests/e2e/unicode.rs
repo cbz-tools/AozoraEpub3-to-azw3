@@ -1,13 +1,15 @@
-mod support;
+//! Primary audit coverage: F-05.
 
 use std::io::{Cursor, Read};
 
-use support::{convert_epub, unicode_recipe};
+use crate::support::{convert_epub, unicode_recipe};
 use zip::ZipArchive;
 
+// E2E-ID: E2E-UNICODE-01
+// Audit: G4-01; F-05
 #[test]
 fn unicode_scalars_survive_source_xhtml_and_kf8_rawml_without_normalization() {
-    // Audit coverage: F-05 exact scalar transport for IVS, combining marks,
+    // Audit coverage: F-05 and G4-07..G4-11 exact scalar transport for IVS, combining marks,
     // and supplementary-plane characters.
     let epub = unicode_recipe();
     let source = epub_xhtml(&epub);

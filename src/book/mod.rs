@@ -6,8 +6,12 @@ mod style;
 
 pub(crate) use content::plain_display_text;
 pub use content::{ContentDocument, SemanticDocument};
-pub use layout::{Direction, Layout, PageProgression, WritingMode};
+pub use layout::{
+    Direction, Layout, PageProgression, PageSpread, RenditionAlign, RenditionFlow,
+    RenditionOrientation, RenditionSemantics, RenditionSpread, WritingMode,
+};
 pub use metadata::Metadata;
+pub(crate) use metadata::{CollectionMetadata, CreatorMetadata, MetadataRecord};
 pub use resource::{Resource, Resources};
 pub use style::{CssDeclaration, CssRule, StyleSheet, Styles};
 
@@ -19,6 +23,7 @@ pub struct Book {
     pub content: Vec<ContentDocument>,
     pub resources: Resources,
     pub layout: Layout,
+    pub rendition: RenditionSemantics,
     // The parsed stylesheet graph is part of the semantic Book IR even though
     // KF8 transport currently reads the original CSS resources instead.
     #[allow(dead_code)]
@@ -52,9 +57,21 @@ pub struct Navigation {
     #[allow(dead_code)]
     pub title: Option<String>,
     pub items: Vec<NavigationItem>,
+    /// EPUB `page-list` entries are kept independent from the logical TOC.
+    pub page_list: Vec<NavigationItem>,
     /// Semantic routes from the EPUB navigation landmarks section. These are
     /// retained even when an NCX is selected as the visible TOC source.
     pub landmarks: Vec<NavigationLandmark>,
+    /// Additional EPUB navigation documents have no defined KF8 UI. Their
+    /// parsed entries remain typed so normalization can intentionally ignore
+    /// them without collapsing recognized navigation channels.
+    pub custom: Vec<NavigationGroup>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NavigationGroup {
+    pub kind: String,
+    pub items: Vec<NavigationItem>,
 }
 
 #[derive(Debug, Clone, Default)]

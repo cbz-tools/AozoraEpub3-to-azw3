@@ -1,3 +1,9 @@
+//! Primary audit coverage: A-11, C-14..C-16, D-11; broad semantic evidence
+//! for the canonical AozoraEpub3 path. This fixture does not claim Layer L.
+
+// E2E-ID: E2E-CANON-01
+// Audit: G2-01, G2-02, G2-04, G2-05, G3-01, G3-18, G3-21, G3-22, G3-23, G3-24, G3-25, G3-26, G4-01, G4-02, G6-01, G6-17, G6-18, G7-17, G7-19, G7-20, G7-21, G7-22, G7-23; A-01, A-03..A-08, A-12..A-14, B-01..B-07, B-18..B-22, C-01..C-03, D-06..D-10, D-12, D-14..D-15, E-01..E-03, F-01..F-08, F-10..F-14
+
 mod support;
 
 use std::collections::HashSet;
@@ -8,10 +14,11 @@ use support::{Azw3, SOVEREIGN_EPUB, convert_fixture, epub_text};
 
 #[test]
 fn sovereign_stars_preserves_source_semantics_through_kf8() {
-    // Audit coverage: A-01, A-03..A-14; applicable B/C/D/E contracts;
+    // Audit coverage: A-01, A-03..A-08, A-12..A-14, B-01..B-07,
+    // B-18..B-22, C-01..C-03, D-06..D-10, D-12, D-14..D-15, E-01..E-03,
     // F-01..F-08 and F-10..F-14. Low-level D geometry is asserted in
-    // large_index_e2e; this fixture does not claim item-level page-flow
-    // coverage.
+    // `large_index_e2e.rs`; this fixture does not claim item-level page-flow
+    // coverage or diagnostic B-11/D-13 parity.
     let source = epub_text(SOVEREIGN_EPUB);
     let (_, azw3) = convert_fixture(SOVEREIGN_EPUB);
     let rawml = String::from_utf8(azw3.rawml()).expect("Sovereign RawML is UTF-8");
@@ -124,9 +131,12 @@ fn sovereign_stars_preserves_source_semantics_through_kf8() {
     }
 }
 
+// E2E-ID: E2E-CANON-02
+// Audit: A-11, E-04, E-06, F-10..F-12
 #[test]
 fn sovereign_stars_normalizes_cover_and_toc_landmarks_to_distinct_kf8_targets() {
-    // A-11: a suppressed source cover document keeps its cover landmark tied
+    // Audit coverage: A-11, E-04, E-06, F-10..F-12. A suppressed source cover
+    // document keeps its cover landmark tied
     // to the native cover resource, while the TOC remains a nav position.
     let source = epub_text(SOVEREIGN_EPUB);
     let source_landmarks = landmark_hrefs(&source);
@@ -232,9 +242,12 @@ fn sovereign_stars_normalizes_cover_and_toc_landmarks_to_distinct_kf8_targets() 
     assert_eq!(nav_sections, vec![toc_section]);
 }
 
+// E2E-ID: E2E-CANON-04
+// Audit: D-11
 #[test]
 fn kf8_fcis_uses_evidenced_canonical_shape_for_nine_flows() {
-    // D-11: the evidenced KindleGen/calibre-compatible KF8 shape is fixed at
+    // Audit coverage: D-11 only. The evidenced KindleGen/calibre-compatible
+    // KF8 shape is fixed at
     // 52 bytes with field @12 equal to 2. Its exact semantic name is
     // undocumented; neither value nor record length is an FDST flow count.
     let (_, azw3) = convert_fixture(SOVEREIGN_EPUB);
@@ -354,11 +367,11 @@ fn u32_be(bytes: &[u8], offset: usize) -> u32 {
     u32::from_be_bytes(bytes[offset..offset + 4].try_into().expect("u32 bounds"))
 }
 
+// E2E-ID: E2E-CANON-03
+// Audit: G6-17, G7-17, G7-19, G7-20, G7-21, G7-22, G7-23; C-14..C-16, B-19, B-20, F-01, F-02, F-07
 #[test]
 fn sovereign_stars_materializes_ordered_lists_spans_and_writing_topology() {
-    // C-14: ordered-list ordinal materialization and span AIDs.
-    // C-15: source/output span and AID preservation.
-    // C-16: canonical html.hltr/body/div.main.vrtl topology and writing metadata.
+    // Audit coverage: C-14, C-15, C-16, B-19, B-20, F-01, F-02, F-07.
     let source = epub_text(SOVEREIGN_EPUB);
     let (_, azw3) = convert_fixture(SOVEREIGN_EPUB);
     let rawml = String::from_utf8(azw3.rawml()).expect("Sovereign RawML is UTF-8");

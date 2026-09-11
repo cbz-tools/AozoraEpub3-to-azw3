@@ -1,11 +1,16 @@
-mod support;
+//! Primary audit coverage: B-02, B-05a, and applicable text-record geometry.
 
 use std::collections::HashMap;
 
-use support::CRIME_EPUB;
+use crate::support;
+use crate::support::CRIME_EPUB;
 
+// E2E-ID: E2E-BINARY-01
+// Audit: B-02, B-04, B-05a; applicable Layer D text-record geometry
 #[test]
 fn palmdoc_payloads_remain_byte_identical_to_the_legacy_encoder() {
+    // Audit coverage: B-02, B-04, B-05a and directly exercised text-record
+    // compression/UTF-8-overlap geometry. This does not claim B-11 parity.
     let input = std::fs::read(CRIME_EPUB).expect("read the canonical large fixture");
     let compressed = support::convert_epub(input.clone());
     let uncompressed = support::convert_epub_uncompressed(input);

@@ -1,10 +1,12 @@
-mod support;
+//! Primary audit coverage: A-15, A-16, C-05..C-12, E-14, F-09.
 
-use support::{convert_epub, mixed_layout_fixed_page_recipe};
+use crate::support::{convert_epub, mixed_layout_fixed_page_recipe};
 
+// E2E-ID: E2E-FXL-01
+// Audit: A-15, A-16, C-05..C-12, E-14, F-09
 #[test]
 fn item_level_pre_paginated_semantic_lowers_to_a_dedicated_svg_flow() {
-    // A-15/A-16, C-05..C-12, E-14, F-09. This fixture is intentionally
+    // Audit coverage: A-15, A-16, C-05..C-12, E-14, F-09. This fixture is intentionally
     // independent of the production flow encoder and has no publication-level
     // fixed-layout declaration.
     let azw3 = convert_epub(mixed_layout_fixed_page_recipe());

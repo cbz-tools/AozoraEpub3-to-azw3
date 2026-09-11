@@ -9,10 +9,15 @@ use crate::xhtml::scan::{find_ascii_case_insensitive, html_tag_end, html_tag_nam
 
 const COVER_LANDMARK_MARKER: &str = "kindle:cover-landmark";
 
-/// Normalize the semantic Book IR into the Kindle-specific IR consumed by the
-/// KF8 writer. Container and record details deliberately stay in `kf8`.
-pub(crate) fn normalize(book: Book) -> KindleBook {
-    let cover_hrefs = cover_document_hrefs(&book);
+struct CoverPhase {
+    cover_hrefs: HashSet<String>,
+    cover_ids: HashSet<String>,
+    keep_comic_cover_page: bool,
+    omitted_cover_hrefs: HashSet<String>,
+}
+
+fn prepare_cover_phase(book: &Book) -> CoverPhase {
+    let cover_hrefs = cover_document_hrefs(book);
     let cover_ids = book
         .content
         .iter()
@@ -35,6 +40,23 @@ pub(crate) fn normalize(book: Book) -> KindleBook {
         .map(|item| document_path(&item.href))
         .filter(|href| !href.is_empty())
         .collect::<HashSet<_>>();
+    CoverPhase {
+        cover_hrefs,
+        cover_ids,
+        keep_comic_cover_page,
+        omitted_cover_hrefs,
+    }
+}
+
+/// Normalize the semantic Book IR into the Kindle-specific IR consumed by the
+/// KF8 writer. Container and record details deliberately stay in `kf8`.
+pub(crate) fn normalize(book: Book) -> KindleBook {
+    let CoverPhase {
+        cover_hrefs,
+        cover_ids,
+        keep_comic_cover_page,
+        omitted_cover_hrefs,
+    } = prepare_cover_phase(&book);
     let mut content_by_id = book
         .content
         .into_iter()
@@ -71,10 +93,20 @@ pub(crate) fn normalize(book: Book) -> KindleBook {
                 referenced_styles: content.referenced_styles,
                 linear: item.linear,
                 layout,
+                rendition: content.rendition,
+                source_properties: content.source_properties,
+                source_spine_index: Some(content.source_spine_index),
             })
         })
         .collect();
     let navigation = prune_navigation(book.navigation.items, &cover_hrefs)
+        .into_iter()
+        .map(KindleNavigationItem::from)
+        .collect::<Vec<_>>();
+    let page_list = book
+        .navigation
+        .page_list
+        .clone()
         .into_iter()
         .map(KindleNavigationItem::from)
         .collect::<Vec<_>>();
@@ -110,10 +142,31 @@ pub(crate) fn normalize(book: Book) -> KindleBook {
                 referenced_styles: Vec::new(),
                 linear: true,
                 layout: KindleLayoutSemantic::Reflowable,
+                rendition: Default::default(),
+                source_properties: Vec::new(),
+                source_spine_index: None,
             },
         );
         Some(href)
     };
+    if !page_list.is_empty() {
+        let href = synthetic_page_list_href(&sections, &book.resources.items);
+        let insert_at = usize::from(toc_href.is_some()).min(sections.len());
+        sections.insert(
+            insert_at,
+            KindleSection {
+                id: "__kindle_page_list".to_owned(),
+                href,
+                source_xhtml: render_synthetic_page_list(&page_list),
+                referenced_styles: Vec::new(),
+                linear: true,
+                layout: KindleLayoutSemantic::Reflowable,
+                rendition: Default::default(),
+                source_properties: Vec::new(),
+                source_spine_index: None,
+            },
+        );
+    }
     let fallback_body_href = sections
         .iter()
         .find(|section| {
@@ -171,23 +224,9 @@ pub(crate) fn normalize(book: Book) -> KindleBook {
             });
         }
     }
-    let metadata = book.metadata;
+    let metadata = normalize_metadata(book.metadata, book.rendition);
     KindleBook {
-        metadata: KindleMetadata {
-            title: metadata.title,
-            creator: metadata.creator,
-            language: metadata.language,
-            identifier: metadata.identifier,
-            publisher: metadata.publisher,
-            description: metadata.description,
-            cover_resource_id: metadata.cover,
-            is_fixed_layout: metadata.is_fixed_layout,
-            primary_writing_mode: metadata.primary_writing_mode,
-            book_type: metadata.book_type,
-            orientation: metadata.orientation,
-            orientation_lock: metadata.orientation_lock,
-            original_resolution: metadata.original_resolution,
-        },
+        metadata,
         layout: KindleLayout {
             writing_mode: book.layout.writing_mode,
             page_progression: book.layout.page_progression,
@@ -196,34 +235,91 @@ pub(crate) fn normalize(book: Book) -> KindleBook {
         sections,
         navigation,
         landmarks,
-        resources: book
-            .resources
-            .items
-            .into_iter()
-            .map(|resource| {
-                let crate::book::Resource {
-                    id,
-                    href,
-                    media_type,
-                    properties,
-                    data,
-                } = resource;
-                let is_css = media_type.eq_ignore_ascii_case("text/css");
-                KindleResource {
-                    id,
-                    href,
-                    media_type,
-                    properties,
-                    data: if is_css {
-                        crate::kindle::project_css_for_kindle(&String::from_utf8_lossy(&data))
-                            .into_bytes()
-                    } else {
-                        data
-                    },
-                }
-            })
-            .collect(),
+        resources: normalize_resources(book.resources.items),
     }
+}
+
+fn normalize_metadata(
+    metadata: crate::book::Metadata,
+    rendition: crate::book::RenditionSemantics,
+) -> KindleMetadata {
+    let mut orientation = metadata.orientation.clone();
+    if orientation.is_none() {
+        orientation = match rendition.spread {
+            Some(crate::book::RenditionSpread::Landscape) => Some("landscape".to_owned()),
+            Some(crate::book::RenditionSpread::Portrait) => Some("portrait".to_owned()),
+            _ => None,
+        };
+    }
+    let mut authors = Vec::new();
+    let mut contributors = Vec::new();
+    for creator in &metadata.creators {
+        match creator.role.as_deref() {
+            Some(role) if is_author_role(role) => authors.push(creator.value.clone()),
+            Some(_) => contributors.push(creator.value.clone()),
+            None if authors.is_empty() => authors.push(creator.value.clone()),
+            None => contributors.push(creator.value.clone()),
+        }
+    }
+    contributors.extend(metadata.contributors);
+    if authors.is_empty() {
+        if let Some(creator) = metadata.creator.as_ref() {
+            authors.push(creator.clone());
+        }
+    }
+    KindleMetadata {
+        title: metadata.title,
+        creator: metadata.creator,
+        authors,
+        contributors,
+        language: metadata.language,
+        identifier: metadata.identifier,
+        publisher: metadata.publisher,
+        description: metadata.description,
+        cover_resource_id: metadata.cover,
+        is_fixed_layout: metadata.is_fixed_layout,
+        primary_writing_mode: metadata.primary_writing_mode,
+        book_type: metadata.book_type,
+        orientation,
+        orientation_lock: metadata.orientation_lock,
+        original_resolution: metadata.original_resolution,
+        rendition_viewport: metadata.rendition_viewport,
+        title_file_as: metadata.title_file_as,
+        creator_file_as: metadata.creator_file_as,
+        publisher_file_as: metadata.publisher_file_as,
+        rendition,
+    }
+}
+
+fn normalize_resources(resources: Vec<crate::book::Resource>) -> Vec<KindleResource> {
+    resources
+        .into_iter()
+        .map(|resource| {
+            let crate::book::Resource {
+                id,
+                href,
+                media_type,
+                properties,
+                data,
+            } = resource;
+            let is_css = media_type.eq_ignore_ascii_case("text/css");
+            KindleResource {
+                id,
+                href,
+                media_type,
+                properties,
+                data: if is_css {
+                    crate::kindle::project_css_for_kindle(
+                        std::str::from_utf8(&data)
+                            .expect("EPUB CSS resources are normalized to UTF-8"),
+                    )
+                    .into_bytes()
+                } else {
+                    data
+                },
+            }
+        })
+        .collect()
 }
 
 fn is_bodymatter_landmark(kind: &str) -> bool {
@@ -502,6 +598,26 @@ fn synthetic_toc_href(sections: &[KindleSection], resources: &[crate::book::Reso
     }
 }
 
+fn synthetic_page_list_href(
+    sections: &[KindleSection],
+    resources: &[crate::book::Resource],
+) -> String {
+    let mut index = 0usize;
+    loop {
+        let href = if index == 0 {
+            "__kindle_page_list.xhtml".to_owned()
+        } else {
+            format!("__kindle_page_list-{index}.xhtml")
+        };
+        if sections.iter().all(|section| section.href != href)
+            && resources.iter().all(|resource| resource.href != href)
+        {
+            return href;
+        }
+        index += 1;
+    }
+}
+
 fn render_synthetic_toc(items: &[KindleNavigationItem]) -> String {
     let mut output = String::from(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -512,6 +628,19 @@ fn render_synthetic_toc(items: &[KindleNavigationItem]) -> String {
     render_synthetic_toc_items(items, &mut output);
     output.push_str("</ol></nav></body></html>");
     output
+}
+
+fn render_synthetic_page_list(items: &[KindleNavigationItem]) -> String {
+    let mut output = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>Page List</title></head><body><nav epub:type="page-list"><h1>Page List</h1><ol>"#,
+    );
+    render_synthetic_toc_items(items, &mut output);
+    output.push_str("</ol></nav></body></html>");
+    output
+}
+
+fn is_author_role(role: &str) -> bool {
+    matches!(role.trim().to_ascii_lowercase().as_str(), "aut" | "author")
 }
 
 fn render_synthetic_toc_items(items: &[KindleNavigationItem], output: &mut String) {

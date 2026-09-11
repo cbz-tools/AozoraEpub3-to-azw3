@@ -11,7 +11,9 @@ use quick_xml::events::{BytesStart, Event};
 
 use super::opf::{ManifestItem, attr, local_name};
 use super::package::resolve_href;
-use crate::book::{Navigation, NavigationItem, NavigationLandmark, plain_display_text};
+use crate::book::{
+    Navigation, NavigationGroup, NavigationItem, NavigationLandmark, plain_display_text,
+};
 use crate::error::{Error, Result};
 pub(super) fn parse_ncx(xml: &[u8]) -> Result<Navigation> {
     let mut reader = Reader::from_reader(Cursor::new(xml));
@@ -101,6 +103,7 @@ pub(super) fn parse_nav_xhtml(xml: &[u8]) -> Result<Navigation> {
     let mut buffer = Vec::new();
     let mut navigation = Navigation::default();
     let mut current_anchor: Option<(NavigationItem, Option<String>)> = None;
+    let mut current_unlinked_span: Option<String> = None;
     let mut list_items: Vec<(NavigationItem, Option<String>)> = Vec::new();
     let mut nav_stack: Vec<Option<String>> = Vec::new();
     loop {
@@ -123,9 +126,22 @@ pub(super) fn parse_nav_xhtml(xml: &[u8]) -> Result<Navigation> {
                     kind,
                 ));
             }
+            Event::Start(event)
+                if local_name(event.name().as_ref()) == "span"
+                    && current_anchor.is_none()
+                    && !list_items.is_empty() =>
+            {
+                current_unlinked_span = Some(String::new());
+            }
             Event::Text(event) => {
                 if let Some((item, _)) = current_anchor.as_mut() {
                     item.label.push_str(
+                        &event
+                            .unescape()
+                            .map_err(|error| Error::Xml(error.to_string()))?,
+                    );
+                } else if let Some(heading) = current_unlinked_span.as_mut() {
+                    heading.push_str(
                         &event
                             .unescape()
                             .map_err(|error| Error::Xml(error.to_string()))?,
@@ -143,6 +159,15 @@ pub(super) fn parse_nav_xhtml(xml: &[u8]) -> Result<Navigation> {
                 if let Some((item, _)) = current_anchor.as_mut() {
                     item.label
                         .push_str(&String::from_utf8_lossy(event.as_ref()));
+                } else if let Some(heading) = current_unlinked_span.as_mut() {
+                    heading.push_str(&String::from_utf8_lossy(event.as_ref()));
+                }
+            }
+            Event::End(event) if local_name(event.name().as_ref()) == "span" => {
+                if let Some(heading) = current_unlinked_span.take()
+                    && let Some((item, _)) = list_items.last_mut()
+                {
+                    item.label = plain_display_text(&heading);
                 }
             }
             Event::End(event) if local_name(event.name().as_ref()) == "a" => {
@@ -193,18 +218,31 @@ fn append_nav_item(
     anchor_kind: Option<String>,
     nav_kind: Option<String>,
 ) {
-    if nav_kind
-        .as_deref()
-        .is_some_and(|kind| has_token(kind, "landmarks"))
-    {
+    let nav_kind = nav_kind.unwrap_or_default();
+    if has_token(&nav_kind, "landmarks") {
         let kind = anchor_kind.unwrap_or_default();
         navigation.landmarks.push(NavigationLandmark {
             kind: normalize_landmark_kind(&kind),
             label: item.label,
             href: item.href,
         });
-    } else {
+    } else if has_token(&nav_kind, "page-list") || has_token(&nav_kind, "page_list") {
+        navigation.page_list.push(item);
+    } else if nav_kind.is_empty() || has_token(&nav_kind, "toc") {
         navigation.items.push(item);
+    } else {
+        let group = navigation
+            .custom
+            .iter_mut()
+            .find(|group| group.kind.eq_ignore_ascii_case(&nav_kind));
+        if let Some(group) = group {
+            group.items.push(item);
+        } else {
+            navigation.custom.push(NavigationGroup {
+                kind: nav_kind,
+                items: vec![item],
+            });
+        }
     }
 }
 
@@ -250,6 +288,9 @@ pub(super) fn canonicalize_navigation(
     for item in &mut navigation.items {
         canonicalize_navigation_item(item, navigation_base, opf_base, manifest);
     }
+    for item in &mut navigation.page_list {
+        canonicalize_navigation_item(item, navigation_base, opf_base, manifest);
+    }
     for landmark in &mut navigation.landmarks {
         let (target_path, suffix) = split_link_suffix(&landmark.href);
         if !target_path.is_empty() {
@@ -265,6 +306,11 @@ pub(super) fn canonicalize_navigation(
             } else {
                 landmark.href = format!("{}{}", resolved_target, suffix);
             }
+        }
+    }
+    for group in &mut navigation.custom {
+        for item in &mut group.items {
+            canonicalize_navigation_item(item, navigation_base, opf_base, manifest);
         }
     }
 }

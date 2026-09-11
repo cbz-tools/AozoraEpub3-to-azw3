@@ -5,6 +5,12 @@ pub fn project_css_for_kindle(source: &str) -> String {
     project_css_range(source, 0, source.len())
 }
 
+/// Project declarations from an inline `style="..."` attribute with the
+/// same declaration-level rules used for stylesheet blocks.
+pub(crate) fn project_inline_style_for_kindle(source: &str) -> String {
+    project_declarations(source)
+}
+
 fn project_css_range(source: &str, start: usize, end: usize) -> String {
     let Some(open) = find_top_level_open(source, start, end) else {
         return source[start..end].to_owned();
@@ -30,18 +36,18 @@ fn project_css_range(source: &str, start: usize, end: usize) -> String {
     {
         result.push_str(&project_css_range(source, open + 1, close));
     } else {
-        result.push_str(&project_declarations(body, prelude));
+        result.push_str(&project_declarations(body));
     }
     result.push('}');
     result.push_str(&project_css_range(source, close + 1, end));
     result
 }
 
-fn project_declarations(source: &str, selector: &str) -> String {
-    let remove_measure = is_aozora_measure_selector(selector);
+fn project_declarations(source: &str) -> String {
     let mut result = String::with_capacity(source.len());
     let mut segment_start = 0;
     let mut cursor = 0;
+    let mut paren_depth = 0usize;
     while cursor < source.len() {
         let next = advance_css_char(source, cursor);
         match source.as_bytes()[cursor] {
@@ -51,39 +57,43 @@ fn project_declarations(source: &str, selector: &str) -> String {
             b'\'' | b'"' => {
                 cursor = skip_string(source, cursor).unwrap_or(source.len());
             }
-            b';' => {
-                append_declaration(&mut result, &source[segment_start..cursor], remove_measure);
-                result.push(';');
+            b'(' => {
+                paren_depth += 1;
+                cursor = next;
+            }
+            b')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                cursor = next;
+            }
+            b';' if paren_depth == 0 => {
+                if append_declaration(&mut result, &source[segment_start..cursor]) {
+                    result.push(';');
+                }
                 cursor = next;
                 segment_start = cursor;
             }
             _ => cursor = next,
         }
     }
-    append_declaration(&mut result, &source[segment_start..], remove_measure);
+    append_declaration(&mut result, &source[segment_start..]);
     result
 }
 
-fn append_declaration(result: &mut String, declaration: &str, remove_measure: bool) {
-    let property_start = declaration
-        .find(|character: char| !character.is_ascii_whitespace())
-        .unwrap_or(declaration.len());
-    let property_end = declaration[property_start..]
-        .find(':')
-        .map(|offset| property_start + offset)
-        .unwrap_or(property_start);
+fn append_declaration(result: &mut String, declaration: &str) -> bool {
+    let property_start = skip_css_trivia(declaration, 0);
+    let property_end = find_property_colon(declaration, property_start).unwrap_or(property_start);
     if property_start == property_end {
         result.push_str(declaration);
-        return;
+        return true;
     }
-    let property = declaration[property_start..property_end]
+    let property = remove_css_comments(&declaration[property_start..property_end])
         .trim()
         .to_ascii_lowercase();
-    if remove_measure && matches!(property.as_str(), "max-width" | "max-height") {
+    if matches!(property.as_str(), "max-width" | "max-height") {
         // Keep indentation/comments around the removed declaration so this
         // projection does not become a whitespace or comment normalizer.
         result.push_str(&declaration[..property_start]);
-        return;
+        return false;
     }
     let projected = match property.as_str() {
         "-epub-writing-mode" => Some("-webkit-writing-mode"),
@@ -93,7 +103,7 @@ fn append_declaration(result: &mut String, declaration: &str, remove_measure: bo
     };
     let Some(projected) = projected else {
         result.push_str(declaration);
-        return;
+        return true;
     };
     result.push_str(&declaration[..property_start]);
     if projected == "-webkit-text-emphasis-" {
@@ -103,44 +113,7 @@ fn append_declaration(result: &mut String, declaration: &str, remove_measure: bo
         result.push_str(projected);
     }
     result.push_str(&declaration[property_end..]);
-}
-
-fn is_aozora_measure_selector(selector: &str) -> bool {
-    // Comments can contain examples of generated selectors; they are not
-    // selector context and must not widen the projection policy.
-    let selector = remove_comments(selector);
-    let bytes = selector.as_bytes();
-    let mut cursor = 0;
-    while cursor < bytes.len() {
-        if bytes[cursor] != b'.' {
-            cursor = advance_css_char(&selector, cursor);
-            continue;
-        }
-        let start = cursor + 1;
-        let mut end = start;
-        while end < bytes.len()
-            && (bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'_' | b'-'))
-        {
-            end += 1;
-        }
-        let class = selector[start..end].to_ascii_lowercase();
-        if class == "fit"
-            || class.starts_with("max-width-")
-            || class.starts_with("max-height-")
-            || class.starts_with("max-measure-")
-            || class.starts_with("max-extent-")
-            || class.starts_with("max-size-")
-            || (class.starts_with("jzm") && class[3..].chars().all(|c| c.is_ascii_digit()))
-        {
-            return true;
-        }
-        cursor = end.max(cursor + 1);
-    }
-    // AozoraEpub3 uses these direction-qualified image wrappers for the
-    // logical max-width/max-height pair. Keep ordinary `span.img` and
-    // unrelated selectors untouched.
-    let has_image_wrapper = selector.contains("span.img");
-    has_image_wrapper && (selector.contains(".vrtl") || selector.contains(".hltr"))
+    true
 }
 
 fn find_top_level_open(source: &str, start: usize, end: usize) -> Option<usize> {
@@ -206,23 +179,60 @@ fn skip_string(source: &str, start: usize) -> Option<usize> {
     None
 }
 
+fn skip_css_trivia(source: &str, mut cursor: usize) -> usize {
+    loop {
+        while source
+            .as_bytes()
+            .get(cursor)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            cursor += 1;
+        }
+        if source.as_bytes().get(cursor) == Some(&b'/')
+            && source.as_bytes().get(cursor + 1) == Some(&b'*')
+        {
+            cursor = skip_comment(source, cursor).unwrap_or(source.len());
+            continue;
+        }
+        return cursor;
+    }
+}
+
+fn find_property_colon(source: &str, start: usize) -> Option<usize> {
+    let mut cursor = start;
+    while cursor < source.len() {
+        match source.as_bytes()[cursor] {
+            b'/' if source.as_bytes().get(cursor + 1) == Some(&b'*') => {
+                cursor = skip_comment(source, cursor).unwrap_or(source.len());
+            }
+            b'\'' | b'"' => {
+                cursor = skip_string(source, cursor).unwrap_or(source.len());
+            }
+            b':' => return Some(cursor),
+            _ => cursor = advance_css_char(source, cursor),
+        }
+    }
+    None
+}
+
+fn remove_css_comments(source: &str) -> String {
+    let mut result = String::with_capacity(source.len());
+    let mut cursor = 0;
+    while cursor < source.len() {
+        if source.as_bytes()[cursor] == b'/' && source.as_bytes().get(cursor + 1) == Some(&b'*') {
+            cursor = skip_comment(source, cursor).unwrap_or(source.len());
+        } else {
+            let next = advance_css_char(source, cursor);
+            result.push_str(&source[cursor..next]);
+            cursor = next;
+        }
+    }
+    result
+}
+
 fn advance_css_char(source: &str, cursor: usize) -> usize {
     source
         .get(cursor..)
         .and_then(|remaining| remaining.chars().next())
         .map_or(source.len(), |character| cursor + character.len_utf8())
-}
-
-fn remove_comments(source: &str) -> String {
-    let mut result = String::with_capacity(source.len());
-    let mut rest = source;
-    while let Some(start) = rest.find("/*") {
-        result.push_str(&rest[..start]);
-        let Some(end) = rest[start + 2..].find("*/") else {
-            break;
-        };
-        rest = &rest[start + 2 + end + 2..];
-    }
-    result.push_str(rest);
-    result
 }

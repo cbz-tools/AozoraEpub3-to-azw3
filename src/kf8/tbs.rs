@@ -328,6 +328,12 @@ pub(super) fn flatten_tbs_seeds(
     output: &mut Vec<TbsSeed>,
 ) {
     for item in items {
+        if item.href.is_empty() {
+            // Unlinked EPUB navigation headings are represented in the
+            // synthetic TOC only; TBS entries require a real position target.
+            flatten_tbs_seeds(&item.children, depth, parent, output);
+            continue;
+        }
         let index = output.len();
         output.push(TbsSeed {
             entry: TbsEntry {

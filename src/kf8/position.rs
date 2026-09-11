@@ -4,13 +4,15 @@
 //! its output to PositionMap entries, navigation coordinates, guide positions,
 //! and Start Reading offsets.
 
+use std::collections::HashMap;
+
 use crate::error::{Error, Result};
 use crate::kindle::{KindleLandmark, KindleNavigationItem, KindleSection};
 use crate::xhtml::path::normalize_path_lossy;
+use crate::xhtml::scan::{Tag, tags};
 
 use super::SectionParts;
 pub(crate) use super::fragmentize::{FragmentContext, body_range};
-use super::fragmentize::{non_element_markup_end, raw_text_element_end, tag_end};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Position data for an anchor in generated XHTML and its KF8 projections.
@@ -93,6 +95,8 @@ pub struct PositionMap {
     pub entries: Vec<PositionMapEntry>,
     pub fragments: Vec<PositionMapFragment>,
     sections: Vec<SectionPosition>,
+    section_by_href: HashMap<String, usize>,
+    entry_by_section_fragment: HashMap<(usize, String), usize>,
 }
 
 impl PositionMap {
@@ -186,41 +190,32 @@ impl PositionMap {
             if section_fragments.is_empty() {
                 return Err(Error::Output("each section requires one FRAG".to_owned()));
             }
-            let first_fragment = section_fragments[0];
+            let mut fragment_cursor = 0;
             for tag in tags(&section.source_xhtml) {
                 let Some(aid) = tag.attribute("aid") else {
                     continue;
                 };
                 let in_body = (body_content_start..body_end).contains(&tag.start);
+                let (fragment_index, relative) = if in_body {
+                    // A parent element retained in SKEL starts before its
+                    // child payload. Bind it to the next payload context;
+                    // only a terminal shell uses the preceding/last context.
+                    fragment_context_for_tag(
+                        &parts.fragment_contexts,
+                        tag.start,
+                        &mut fragment_cursor,
+                    )
+                } else {
+                    (0, 0)
+                };
                 let (
-                    fragment_index,
+                    _,
                     _rendered_fragment_offset,
                     insert_position,
                     payload_start,
                     payload_length,
                     sequence_number,
-                ) = if in_body {
-                    // A parent element retained in SKEL starts before its
-                    // child payload. Bind it to the next payload context;
-                    // only a terminal shell uses the preceding/last context.
-                    let fragment_index =
-                        fragment_index_for_tag(&parts.fragment_contexts, tag.start);
-                    section_fragments[fragment_index]
-                } else {
-                    first_fragment
-                };
-                let relative = if in_body {
-                    parts
-                        .fragment_contexts
-                        .iter()
-                        .find(|context| {
-                            context.source_start <= tag.start && tag.start < context.source_end
-                        })
-                        .and_then(|context| u32::try_from(tag.start - context.source_start).ok())
-                        .unwrap_or(0)
-                } else {
-                    0
-                };
+                ) = section_fragments[fragment_index];
                 let physical = if in_body {
                     payload_start.checked_add(relative).ok_or_else(|| {
                         Error::Output("position map physical offset overflow".to_owned())
@@ -241,13 +236,23 @@ impl PositionMap {
                     .ok_or_else(|| {
                         Error::Output("position map rendered offset overflow".to_owned())
                     })?;
+                let entry_index = map.entries.len();
+                let element_id = tag
+                    .attribute("id")
+                    .or_else(|| tag.attribute("name"))
+                    .map(str::to_owned);
+                if let Some(element_id) = element_id.as_ref() {
+                    map.entry_by_section_fragment
+                        .entry((section_index, element_id.clone()))
+                        .or_insert(entry_index);
+                }
                 map.entries.push(PositionMapEntry {
                     section_index,
                     normalized_offset: u32::try_from(tag.start).map_err(|_| {
                         Error::Output("position map normalized offset exceeds u32".to_owned())
                     })?,
-                    element_id: tag.attribute("id").or_else(|| tag.attribute("name")),
-                    aid: Some(aid),
+                    element_id,
+                    aid: Some(aid.to_owned()),
                     cid: None,
                     fragment_index: u32::try_from(fragment_index).map_err(|_| {
                         Error::Output("position map fragment index exceeds u32".to_owned())
@@ -268,14 +273,19 @@ impl PositionMap {
                     element_name: tag.name().to_ascii_lowercase(),
                 });
             }
-            map.sections.push(SectionPosition {
+            let section_position = SectionPosition {
                 href: section.href.clone(),
                 start: section_start,
                 end: section_end,
                 body_tag_start,
                 body_content_start,
                 linear: section.linear,
-            });
+            };
+            let normalized_href = normalize_path_lossy(&section_position.href);
+            map.section_by_href
+                .entry(normalized_href)
+                .or_insert(section_index);
+            map.sections.push(section_position);
             section_start = section_end;
         }
         Ok(map)
@@ -283,20 +293,18 @@ impl PositionMap {
 
     pub(crate) fn resolve(&self, href: &str) -> Result<ResolvedPosition> {
         let (path, fragment) = split_href(href);
+        let normalized_path = normalize_path_lossy(path);
         let section_index = self
-            .sections
-            .iter()
-            .position(|section| normalize_path_lossy(&section.href) == normalize_path_lossy(path))
+            .section_by_href
+            .get(&normalized_path)
+            .copied()
             .ok_or_else(|| Error::Output(format!("position target does not resolve: {href}")))?;
         let section = &self.sections[section_index];
         if let Some(fragment) = fragment.filter(|fragment| !fragment.is_empty()) {
             let entry = self
-                .entries
-                .iter()
-                .find(|entry| {
-                    entry.section_index == section_index
-                        && entry.element_id.as_deref() == Some(fragment)
-                })
+                .entry_by_section_fragment
+                .get(&(section_index, fragment.to_owned()))
+                .and_then(|&entry_index| self.entries.get(entry_index))
                 .ok_or_else(|| {
                     Error::Output(format!("position fragment does not resolve: {href}"))
                 })?;
@@ -450,143 +458,31 @@ pub(crate) struct GuidePosition {
     pub off: u32,
 }
 
-#[derive(Debug, Clone)]
-struct Tag<'a> {
-    source: &'a str,
-    start: usize,
-    end: usize,
-    name_start: usize,
-    name_end: usize,
+#[derive(Debug, Default)]
+pub(crate) struct AidAssignment {
+    pub(crate) xhtml: String,
+    pub(crate) anchors: AnchorIndex,
 }
 
-impl Tag<'_> {
-    fn name(&self) -> &str {
-        &self.source[self.name_start..self.name_end]
-    }
-
-    fn attribute(&self, wanted: &str) -> Option<String> {
-        let bytes = self.source.as_bytes();
-        let mut cursor = self.name_end;
-        while cursor < self.end {
-            while cursor < self.end && bytes[cursor].is_ascii_whitespace() {
-                cursor += 1;
-            }
-            if cursor >= self.end || bytes[cursor] == b'>' || bytes[cursor] == b'/' {
-                break;
-            }
-            let name_start = cursor;
-            while cursor < self.end
-                && !bytes[cursor].is_ascii_whitespace()
-                && !matches!(bytes[cursor], b'=' | b'>')
-            {
-                cursor += 1;
-            }
-            let name = &self.source[name_start..cursor];
-            while cursor < self.end && bytes[cursor].is_ascii_whitespace() {
-                cursor += 1;
-            }
-            if cursor >= self.end || bytes[cursor] != b'=' {
-                while cursor < self.end && bytes[cursor] != b'>' {
-                    cursor += 1;
-                }
-                continue;
-            }
-            cursor += 1;
-            while cursor < self.end && bytes[cursor].is_ascii_whitespace() {
-                cursor += 1;
-            }
-            let quote = bytes.get(cursor).copied();
-            let (value_start, value_end) = if matches!(quote, Some(b'"') | Some(b'\'')) {
-                cursor += 1;
-                let value_start = cursor;
-                while cursor < self.end && bytes[cursor] != quote.unwrap() {
-                    cursor += 1;
-                }
-                (value_start, cursor)
-            } else {
-                let value_start = cursor;
-                while cursor < self.end
-                    && !bytes[cursor].is_ascii_whitespace()
-                    && bytes[cursor] != b'>'
-                {
-                    cursor += 1;
-                }
-                (value_start, cursor)
-            };
-            if name.eq_ignore_ascii_case(wanted) {
-                return Some(self.source[value_start..value_end].to_owned());
-            }
-            if cursor < self.end && quote.is_some() {
-                cursor += 1;
-            }
-        }
-        None
-    }
-}
-
-fn tags(source: &str) -> Vec<Tag<'_>> {
-    let bytes = source.as_bytes();
-    let mut result = Vec::new();
-    let mut cursor = 0;
-    while let Some(relative) = bytes[cursor..].iter().position(|byte| *byte == b'<') {
-        let start = cursor + relative;
-        if let Some(next) = non_element_markup_end(bytes, start) {
-            cursor = next;
-            continue;
-        }
-        let Some(end) = tag_end(bytes, start) else {
-            break;
-        };
-        let mut name_start = start + 1;
-        while name_start < end && matches!(bytes[name_start], b'/' | b'!' | b'?') {
-            name_start += 1;
-        }
-        let mut name_end = name_start;
-        while name_end < end
-            && !bytes[name_end].is_ascii_whitespace()
-            && !matches!(bytes[name_end], b'/' | b'>')
-        {
-            name_end += 1;
-        }
-        if name_end > name_start {
-            let tag = Tag {
-                source,
-                start,
-                end: end + 1,
-                name_start,
-                name_end,
-            };
-            let opening_tag = tag.source.as_bytes().get(tag.start + 1) != Some(&b'/');
-            let raw_text = opening_tag
-                && !tag.source.as_bytes()[tag.start..tag.end].ends_with(b"/>")
-                && (tag.name().eq_ignore_ascii_case("script")
-                    || tag.name().eq_ignore_ascii_case("style"));
-            result.push(tag);
-            if raw_text {
-                cursor = raw_text_element_end(bytes, end + 1, &source[name_start..name_end])
-                    .map(|(_, close_end)| close_end)
-                    .unwrap_or(bytes.len());
-                continue;
-            }
-        }
-        cursor = end + 1;
-    }
-    result
-}
-
-pub(crate) fn assign_aids(source: &str, next_aid: &mut u32) -> Result<String> {
+pub(crate) fn assign_aids(source: String, next_aid: &mut u32) -> Result<AidAssignment> {
     let bytes = source.as_bytes();
     let mut result = Vec::with_capacity(source.len());
+    let mut anchors = AnchorIndex::default();
     let mut cursor = 0;
-    for tag in tags(source) {
+    let mut changed = false;
+    for tag in tags(&source) {
         if tag.start < cursor {
             continue;
         }
         result.extend_from_slice(&bytes[cursor..tag.start]);
+        if let Ok(offset) = u32::try_from(result.len()) {
+            anchors.add_tag(&tag, offset);
+        }
         let tag_bytes = &bytes[tag.start..tag.end];
         if !is_position_bearing(&tag) || tag.source.as_bytes().get(tag.start + 1) == Some(&b'/') {
             result.extend_from_slice(tag_bytes);
         } else {
+            changed = true;
             let aid = to_base32(*next_aid);
             *next_aid = next_aid
                 .checked_add(1)
@@ -595,9 +491,18 @@ pub(crate) fn assign_aids(source: &str, next_aid: &mut u32) -> Result<String> {
         }
         cursor = tag.end;
     }
+    if !changed {
+        return Ok(AidAssignment {
+            xhtml: source,
+            anchors,
+        });
+    }
     result.extend_from_slice(&bytes[cursor..]);
-    String::from_utf8(result)
-        .map_err(|_| Error::Output("generated XHTML is not valid UTF-8".to_owned()))
+    Ok(AidAssignment {
+        xhtml: String::from_utf8(result)
+            .map_err(|_| Error::Output("generated XHTML is not valid UTF-8".to_owned()))?,
+        anchors,
+    })
 }
 
 /// Decompose the body with the bounded DOM-context strategy observed in
@@ -685,31 +590,76 @@ fn replace_or_add_attribute(tag: &[u8], name: &[u8], value: &[u8]) -> Vec<u8> {
     output
 }
 
-pub(crate) fn anchor_offset(source: &str, fragment: &str) -> Option<u32> {
-    tags(source).into_iter().find_map(|tag| {
-        let matches_id = tag.attribute("id").is_some_and(|value| value == fragment);
-        let matches_name = tag.attribute("name").is_some_and(|value| value == fragment);
-        (matches_id || matches_name)
-            .then(|| u32::try_from(tag.start).ok())
-            .flatten()
-    })
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AnchorIndex {
+    offsets: HashMap<String, u32>,
 }
 
-fn fragment_index_for_tag(contexts: &[FragmentContext], tag_start: usize) -> usize {
-    contexts
-        .iter()
-        .position(|context| context.source_start <= tag_start && tag_start < context.source_end)
-        .or_else(|| {
-            contexts
-                .iter()
-                .position(|context| context.source_start > tag_start)
-        })
-        .or_else(|| {
-            contexts
-                .iter()
-                .rposition(|context| context.source_end <= tag_start)
-        })
-        .unwrap_or(0)
+impl AnchorIndex {
+    pub(crate) fn new(source: &str) -> Self {
+        let mut offsets = HashMap::new();
+        for tag in tags(source) {
+            let Some(offset) = u32::try_from(tag.start).ok() else {
+                continue;
+            };
+            for attribute in ["id", "name"] {
+                if let Some(value) = tag.attribute(attribute) {
+                    if !offsets.contains_key(value) {
+                        offsets.insert(value.to_owned(), offset);
+                    }
+                }
+            }
+        }
+        Self { offsets }
+    }
+
+    fn add_tag(&mut self, tag: &Tag<'_>, offset: u32) {
+        for attribute in ["id", "name"] {
+            if let Some(value) = tag.attribute(attribute) {
+                if !self.offsets.contains_key(value) {
+                    self.offsets.insert(value.to_owned(), offset);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn offset(&self, fragment: &str) -> Option<u32> {
+        self.offsets.get(fragment).copied()
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn anchor_offset(source: &str, fragment: &str) -> Option<u32> {
+    AnchorIndex::new(source).offset(fragment)
+}
+
+fn fragment_context_for_tag(
+    contexts: &[FragmentContext],
+    tag_start: usize,
+    fragment_cursor: &mut usize,
+) -> (usize, u32) {
+    // `fragmentize_body` appends chunks in source order, `merge_fragment_chunks`
+    // preserves that order, and `split_section_parts` maps those chunks to
+    // contexts without reordering them. Since `tags` also yields source order,
+    // the first context whose end is after this tag is a monotonic cursor.
+    while *fragment_cursor < contexts.len() && contexts[*fragment_cursor].source_end <= tag_start {
+        *fragment_cursor += 1;
+    }
+
+    let Some(context) = contexts.get(*fragment_cursor) else {
+        return (contexts.len().saturating_sub(1), 0);
+    };
+    if context.source_start <= tag_start {
+        return (
+            *fragment_cursor,
+            u32::try_from(tag_start - context.source_start).unwrap_or(0),
+        );
+    }
+
+    // The cursor is the first context after a gap, matching the old
+    // first-after fallback. If there is no such context, the last-context
+    // fallback is returned above.
+    (*fragment_cursor, 0)
 }
 
 fn split_href(href: &str) -> (&str, Option<&str>) {

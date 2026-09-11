@@ -1,6 +1,6 @@
 [package]
 name = "aozoraepub3-to-azw3"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A Rust library and CLI for converting AozoraEpub3 EPUB files to KF8-only AZW3"

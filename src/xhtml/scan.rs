@@ -257,3 +257,193 @@ pub(crate) fn html_raw_text_end(source: &str, start: usize, tag_end: usize) -> O
     }
     Some(source.len())
 }
+
+/// A syntax-only XHTML tag view with source-relative byte offsets.
+///
+/// The iterator deliberately keeps the historical KF8 tag-walk behavior:
+/// non-element markup is skipped, quoted tag boundaries are respected, and
+/// script/style payloads are consumed as raw text through their matching end
+/// tag. Callers own semantic interpretation and may borrow the tag source
+/// without materializing the complete document's tag list.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Tag<'a> {
+    pub(crate) source: &'a str,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) name_start: usize,
+    pub(crate) name_end: usize,
+}
+
+impl Tag<'_> {
+    pub(crate) fn name(&self) -> &str {
+        &self.source[self.name_start..self.name_end]
+    }
+
+    pub(crate) fn attribute(&self, wanted: &str) -> Option<&str> {
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.name_end;
+        while cursor < self.end {
+            while cursor < self.end && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor >= self.end || bytes[cursor] == b'>' || bytes[cursor] == b'/' {
+                break;
+            }
+            let name_start = cursor;
+            while cursor < self.end
+                && !bytes[cursor].is_ascii_whitespace()
+                && !matches!(bytes[cursor], b'=' | b'>')
+            {
+                cursor += 1;
+            }
+            let name = &self.source[name_start..cursor];
+            while cursor < self.end && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor >= self.end || bytes[cursor] != b'=' {
+                while cursor < self.end && bytes[cursor] != b'>' {
+                    cursor += 1;
+                }
+                continue;
+            }
+            cursor += 1;
+            while cursor < self.end && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            let quote = bytes.get(cursor).copied();
+            let (value_start, value_end) = if matches!(quote, Some(b'"') | Some(b'\'')) {
+                cursor += 1;
+                let value_start = cursor;
+                while cursor < self.end && bytes[cursor] != quote.unwrap() {
+                    cursor += 1;
+                }
+                (value_start, cursor)
+            } else {
+                let value_start = cursor;
+                while cursor < self.end
+                    && !bytes[cursor].is_ascii_whitespace()
+                    && bytes[cursor] != b'>'
+                {
+                    cursor += 1;
+                }
+                (value_start, cursor)
+            };
+            if name.eq_ignore_ascii_case(wanted) {
+                return Some(&self.source[value_start..value_end]);
+            }
+            if cursor < self.end && quote.is_some() {
+                cursor += 1;
+            }
+        }
+        None
+    }
+}
+
+pub(crate) struct Tags<'a> {
+    source: &'a str,
+    cursor: usize,
+}
+
+pub(crate) fn tags(source: &str) -> Tags<'_> {
+    Tags { source, cursor: 0 }
+}
+
+impl<'a> Iterator for Tags<'a> {
+    type Item = Tag<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let bytes = self.source.as_bytes();
+        while let Some(relative) = bytes[self.cursor..].iter().position(|byte| *byte == b'<') {
+            let start = self.cursor + relative;
+            if let Some(next) = scanner_non_element_markup_end(bytes, start) {
+                self.cursor = next;
+                continue;
+            }
+            let end = html_tag_end(self.source, start)?;
+            let mut name_start = start + 1;
+            while name_start < end && matches!(bytes[name_start], b'/' | b'!' | b'?') {
+                name_start += 1;
+            }
+            let mut name_end = name_start;
+            while name_end < end
+                && !bytes[name_end].is_ascii_whitespace()
+                && !matches!(bytes[name_end], b'/' | b'>')
+            {
+                name_end += 1;
+            }
+            self.cursor = end + 1;
+            if name_end <= name_start {
+                continue;
+            }
+            let tag = Tag {
+                source: self.source,
+                start,
+                end: end + 1,
+                name_start,
+                name_end,
+            };
+            let opening_tag = bytes.get(start + 1) != Some(&b'/');
+            let raw_text = opening_tag
+                && !bytes[start..=end].ends_with(b"/>")
+                && (tag.name().eq_ignore_ascii_case("script")
+                    || tag.name().eq_ignore_ascii_case("style"));
+            if raw_text {
+                self.cursor = scanner_raw_text_element_end(
+                    bytes,
+                    end + 1,
+                    &self.source[name_start..name_end],
+                )
+                .map_or(bytes.len(), |(_, close_end)| close_end);
+            }
+            return Some(tag);
+        }
+        None
+    }
+}
+
+fn scanner_non_element_markup_end(source: &[u8], start: usize) -> Option<usize> {
+    let remainder = source.get(start..)?;
+    if remainder.starts_with(b"<!--") {
+        return find_bytes(remainder, 4, b"-->").map(|offset| start + offset + 3);
+    }
+    if remainder.starts_with(b"<![CDATA[") {
+        return find_bytes(remainder, 9, b"]]>").map(|offset| start + offset + 3);
+    }
+    if remainder
+        .get(1)
+        .is_some_and(|byte| matches!(byte, b'!' | b'?'))
+    {
+        return html_tag_end(std::str::from_utf8(source).ok()?, start).map(|end| end + 1);
+    }
+    None
+}
+
+fn scanner_raw_text_element_end(source: &[u8], start: usize, name: &str) -> Option<(usize, usize)> {
+    let name = name.as_bytes();
+    let mut cursor = start;
+    while cursor + 2 + name.len() <= source.len() {
+        if source[cursor] == b'<'
+            && source.get(cursor + 1) == Some(&b'/')
+            && source
+                .get(cursor + 2..cursor + 2 + name.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
+        {
+            let boundary = source.get(cursor + 2 + name.len()).copied();
+            if boundary.is_some_and(|byte| byte.is_ascii_whitespace() || byte == b'>') {
+                let source = std::str::from_utf8(source).ok()?;
+                let end = html_tag_end(source, cursor)?;
+                return Some((cursor, end + 1));
+            }
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn find_bytes(source: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
+    source
+        .get(start..)?
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|offset| start + offset)
+}

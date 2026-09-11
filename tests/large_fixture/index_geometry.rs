@@ -1,21 +1,24 @@
-mod support;
+//! Primary audit coverage: D-01..D-05, D-15, D-16; applicable B/C/E geometry.
 
-use support::{CRIME_EPUB, SOVEREIGN_EPUB, convert_fixture};
+use crate::support::{CRIME_EPUB, SOVEREIGN_EPUB, convert_fixture};
 
+// E2E-ID: E2E-BINARY-02
+// Audit: G6-01; B-01..B-07, B-18..B-22, C-01..C-03, D-01..D-10, D-12, D-14..D-15, E-01..E-03, E-11, F-05..F-08, F-10..F-14 where exercised
 #[test]
 fn crime_and_punishment_exercises_large_rawml_and_index_geometry() {
-    // Audit coverage: B-01..B-07, B-18..B-22; C-01..C-03; D-01..D-15;
-    // E-01..E-11; F-05..F-08 and F-10..F-14 where exercised.
+    // Audit coverage: B-01..B-07, B-18..B-22; C-01..C-03; D-01..D-10,
+    // D-12, D-14..D-15; E-01..E-03, E-11; F-05..F-08 and F-10..F-14
+    // where exercised. B-11 and D-13 observations remain diagnostic only.
     // The checked-in source has one detail per index; multi-detail routing is
     // intentionally not claimed here. Record-boundary stress is exercised.
     let (input, azw3) = convert_fixture(CRIME_EPUB);
     assert_eq!(input.len(), 673_750, "checked-in generated EPUB changed");
     assert_eq!(
         azw3.bytes.len(),
-        1_878_169,
-        "measured AZW3 geometry changed (C-15 span AIDs and D-11 FCIS shape are intentional)"
+        1_881_846,
+        "measured AZW3 geometry changed (C-15 span AIDs, D-11 FCIS shape, and CSS empty-declaration removal are intentional)"
     );
-    assert_eq!(azw3.record_count(), 575);
+    assert_eq!(azw3.record_count(), 576);
 
     let pd = azw3.palm_doc();
     assert_eq!(pd.compression, 2);
@@ -29,7 +32,7 @@ fn crime_and_punishment_exercises_large_rawml_and_index_geometry() {
     );
     assert_eq!(azw3.mobi().first_non_text, 560);
     assert!(azw3.offsets.windows(2).all(|pair| pair[0] <= pair[1]));
-    assert_eq!(azw3.offsets[0], 78 + 575 * 8 + 2);
+    assert_eq!(azw3.offsets[0], 78 + 576 * 8 + 2);
     assert!(azw3.record(1).len() <= pd.record_size);
     assert!(azw3.record(557).len() <= pd.record_size);
 
@@ -90,9 +93,13 @@ fn crime_and_punishment_exercises_large_rawml_and_index_geometry() {
     assert!(mobi.title_offset + mobi.title_length <= azw3.record_zero().len());
 }
 
+// E2E-ID: E2E-BINARY-03
+// Audit: D-16
 #[test]
 fn sovereign_stars_exercises_multi_detail_indx_geometry() {
-    // D-16 must cross the producer's detail-record threshold.  The fixture is
+    // Audit coverage: D-16. The fixture must cross the producer's detail-record
+    // threshold; this is not evidence for diagnostic D-13.
+    // The fixture is
     // generated through the canonical AozoraEpub3 workflow and contains the
     // dedicated stress section in its source asset.
     let (input, azw3) = convert_fixture(SOVEREIGN_EPUB);

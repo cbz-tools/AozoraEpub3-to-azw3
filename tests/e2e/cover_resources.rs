@@ -1,20 +1,24 @@
-mod support;
+//! Primary audit coverage: A-08..A-11, B-15..B-17, E-04..E-10, F-12.
 
+use crate::support::{
+    CoverRecipe, FixedLayoutDeclaration, convert_epub, cover_bodymatter_landmark_recipe,
+    cover_recipe, fixed_layout_comic_recipe, zip_epub,
+};
 use aozoraepub3_to_azw3::{ConvertOptions, convert_bytes};
 use image::ImageReader;
 use std::io::{Cursor, Read};
-use support::{
-    CoverRecipe, FixedLayoutDeclaration, convert_epub, cover_bodymatter_landmark_recipe,
-    cover_recipe, fixed_layout_comic_recipe,
-};
 use zip::ZipArchive;
 
+// E2E-ID: E2E-COVER-01
+// Audit: G3-18, G6-18; B-15..B-17, E-04..E-10, F-08, F-12
 #[test]
 fn cover_resource_and_library_thumbnail_contract_is_structurally_valid() {
     // Audit coverage: B-15..B-17 and E-04..E-10 (cover resource, EXTH
     // 201/202/129,
     // bounded decodable thumbnail, distinct resources and semantic rather
     // than byte/dimension identity); F-08/F-12 cover/resource preservation.
+    // B-11/EXTH 125 is observed as a diagnostic count only, not primary
+    // release coverage.
     for recipe in [
         CoverRecipe {
             cover_page: false,
@@ -173,8 +177,11 @@ fn cover_resource_and_library_thumbnail_contract_is_structurally_valid() {
     );
 }
 
+// E2E-ID: E2E-COVER-02
+// Audit: A-10, A-12
 #[test]
 fn cover_xhtml_is_suppressed_but_cover_navigation_children_survive() {
+    // Audit coverage: A-10, A-12, D-06..D-08, F-10..F-12.
     // Cover-page suppression is semantic normalization: it must not delete a
     // child body navigation target and must retain the actual cover resource.
     let with_cover_nav = convert_epub(cover_recipe(CoverRecipe {
@@ -217,8 +224,12 @@ fn cover_xhtml_is_suppressed_but_cover_navigation_children_survive() {
     assert!(!without_rawml.contains("Body child"));
 }
 
+// E2E-ID: E2E-COVER-03
+// Audit: A-08, A-10, A-12, B-18, D-07, D-08, E-04..E-08, F-12
 #[test]
 fn omitted_cover_bodymatter_landmarks_target_first_linear_section() {
+    // Audit coverage: A-08, A-10, A-12, B-18, D-07, D-08, E-04..E-08,
+    // F-12. EXTH 125 is intentionally only observed diagnostically.
     let azw3 = convert_epub(cover_bodymatter_landmark_recipe(false));
     let rawml = String::from_utf8(azw3.rawml()).expect("recipe RawML is UTF-8");
     assert!(!rawml.contains("COVER_XHTML_SENTINEL"));
@@ -251,8 +262,12 @@ fn omitted_cover_bodymatter_landmarks_target_first_linear_section() {
     }
 }
 
+// E2E-ID: E2E-COVER-04
+// Audit: G2-04; A-10, A-17b..A-17e, B-08..B-10, B-12..B-14, C-13, E-14
 #[test]
 fn fixed_layout_comic_metadata_and_cover_resource_contract_is_preserved() {
+    // Audit coverage: A-10, A-17b..A-17e, B-08..B-10, B-12..B-14,
+    // C-13, E-14. B-11 remains diagnostic/unresolved.
     for declaration in [
         FixedLayoutDeclaration::FixedLayoutTrue,
         FixedLayoutDeclaration::RenditionPrePaginated,
@@ -260,6 +275,24 @@ fn fixed_layout_comic_metadata_and_cover_resource_contract_is_preserved() {
         let epub = fixed_layout_comic_recipe(declaration);
         assert_fixed_layout_comic_source_contract(&epub, declaration);
         assert_fixed_layout_comic_contract(&epub);
+    }
+}
+
+#[test]
+fn fixed_layout_children_book_type_is_projected_without_synthesis() {
+    // Audit coverage: KAMZ-01. Explicit fixed-layout children lowers to EXTH
+    // 123, while an unknown input value does not synthesize the field.
+    for (book_type, expected) in [
+        ("children", Some("children")),
+        ("COMIC", Some("comic")),
+        ("unknown", None),
+    ] {
+        let package = format!(
+            r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/ops" version="3.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Fixed Layout Type</dc:title><dc:creator>Fixture Author</dc:creator><dc:language>en</dc:language><meta property="rendition:layout">pre-paginated</meta><meta name="book-type" content="{book_type}"/><meta name="orientation-lock" content="none"/><meta name="original-resolution" content="600x800"/></metadata><manifest><item id="body" href="body.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="body"/></spine></package>"#
+        );
+        let body = br#"<html xmlns="http://www.w3.org/1999/xhtml"><head><meta name="viewport" content="width=600,height=800"/></head><body><svg xmlns="http://www.w3.org/2000/svg" width="600" height="800" viewBox="0 0 600 800"><text>KAMZ01_BOOK_TYPE</text></svg></body></html>"#;
+        let azw3 = convert_epub(zip_epub(&package, &[("body.xhtml", body.to_vec())], None));
+        assert_eq!(azw3.exth().text(123).as_deref(), expected);
     }
 }
 
@@ -352,6 +385,8 @@ fn assert_fixed_layout_comic_contract(epub: &[u8]) {
 
 #[test]
 fn missing_non_cover_landmark_target_still_errors() {
+    // Diagnostic safety boundary for A-08/A-12 landmark resolution; not a
+    // primary release-coverage owner.
     let error = convert_bytes(
         &cover_bodymatter_landmark_recipe(true),
         &ConvertOptions::default(),

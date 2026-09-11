@@ -4,24 +4,29 @@
 //! and coordinate semantics; this module coordinates their order and combines
 //! their results without redefining those algorithms.
 
-use super::css_flow::{css_resource_base_href, referenced_css_resources, rewrite_css_assets};
+use super::css_flow::{
+    CssResourceIndex, ResourceIndex, SectionIndex, css_resource_base_href,
+    referenced_css_resources, rewrite_css_assets,
+};
 use super::div::Div;
 use super::exth::ExthHeader;
 use super::fcis::{encode_eof, encode_fcis};
 use super::fdst::Fdst;
 use super::flis::encode_flis;
+use super::format::{to_base32, to_base32_fixed};
 use super::fragment::{Fragment, FragmentEntry};
 use super::guide::Guide;
 use super::mobi_header::MobiHeader;
 use super::ncx::Ncx;
 use super::palmdoc::PalmDocHeader;
-use super::position::{PositionMap, assign_aids};
+use super::position::{AnchorIndex, PositionMap, assign_aids};
 use super::rawml::{
     PendingInternalLink, SectionParts, generated_layout_css, lower_pre_paginated_section,
     materialize_internal_links, rewrite_internal_links, rewrite_layout_class_for_document,
-    rewrite_layout_fallback_link, rewrite_section_assets, rewrite_stylesheet_links_with_references,
-    section_has_explicit_layout, split_section_parts,
+    rewrite_layout_fallback_link, rewrite_projected_attributes,
+    rewrite_stylesheet_links_with_references, section_has_explicit_layout, split_section_parts,
 };
+use super::resc::encode as encode_resc;
 use super::resource::{
     BinaryResourceGeometry, is_binary_resource, is_css_resource, is_text_resource,
 };
@@ -33,12 +38,6 @@ use crate::kindle::{
     KindleSection, KindleWritingMode as WritingMode, generate_library_thumbnail,
     prepare_cover_resource,
 };
-use crate::xhtml::scan::{advance_char, html_local_name_is, html_tag_name_range};
-
-const GENERATED_TEXT_DIRECTORY: &str = "Text";
-const GENERATED_SECTION_PREFIX: &str = "part";
-const GENERATED_SECTION_EXTENSION: &str = ".xhtml";
-pub(crate) const SYNTHETIC_INLINE_CSS_PROPERTY: &str = "__synthetic_inline_css";
 
 #[derive(Debug)]
 pub(crate) struct Kf8Record {
@@ -51,6 +50,7 @@ pub(crate) struct Kf8Book {
     pub mobi: MobiHeader,
     pub exth: ExthHeader,
     pub title: Option<String>,
+    pub resc_record: u32,
     pub records: Vec<Kf8Record>,
 }
 
@@ -58,9 +58,12 @@ pub(crate) struct Kf8Builder;
 
 struct PreparedContent<'a> {
     sections: Vec<KindleSection>,
-    css_resources: Vec<&'a KindleResource>,
+    resource_index: ResourceIndex<'a>,
+    css_resources: CssResourceIndex<'a>,
+    section_index: SectionIndex,
     page_flows: Vec<Vec<u8>>,
     pending_links: Vec<Vec<PendingInternalLink>>,
+    uses_generated_layout: bool,
     library_thumbnail: Option<Vec<u8>>,
 }
 
@@ -77,7 +80,7 @@ struct TextGeometry {
 
 struct TextData {
     sections: Vec<KindleSection>,
-    section_parts: Vec<SectionParts>,
+    skel: Skel,
     position_map: PositionMap,
     text_records: Vec<TextRecord>,
     text_length_u32: u32,
@@ -89,6 +92,7 @@ struct TextData {
 }
 
 struct Indexes {
+    resc_sections: Vec<KindleSection>,
     position_map: PositionMap,
     text_records: Vec<TextRecord>,
     indexing_tbs: Vec<Vec<u8>>,
@@ -124,6 +128,7 @@ struct PhysicalLayout {
     fdst_record: u32,
     fcis_record: u32,
     flis_record: u32,
+    resc_record: u32,
     geometry: BinaryResourceGeometry,
 }
 
@@ -141,7 +146,7 @@ impl Kf8Builder {
             library_thumbnail,
             cover_resource_id.as_deref(),
         )?;
-        let geometry = build_geometry(&book, &resources, prepared)?;
+        let geometry = build_geometry(&book, prepared)?;
         book.resources = resources;
         let text = build_text_records(geometry)?;
         let indexes = build_indexes(&book, text)?;
@@ -167,58 +172,122 @@ fn prepare_content<'a>(
     library_thumbnail: Option<Vec<u8>>,
     cover_resource_id: Option<&str>,
 ) -> Result<PreparedContent<'a>> {
-    let css_resources = referenced_css_resources(sections, resources);
+    let (resource_index, section_lookup, css_resources, layout_flow_number) =
+        classify_content(sections, resources);
+    let (sections, uses_generated_layout) = project_style_and_resources(
+        sections,
+        &resource_index,
+        &css_resources,
+        layout_flow_number,
+        cover_resource_id,
+    )?;
+    let (mut sections, page_flows) =
+        normalize_structural_content(sections, &css_resources, uses_generated_layout)?;
+    let anchor_indices = assign_positioning_metadata(&mut sections)?;
+    let pending_links = prepare_link_materialization(
+        &mut sections,
+        &section_lookup,
+        &anchor_indices,
+        &css_resources,
+    )?;
+    Ok(PreparedContent {
+        sections,
+        resource_index,
+        css_resources,
+        section_index: section_lookup,
+        page_flows,
+        pending_links,
+        uses_generated_layout,
+        library_thumbnail,
+    })
+}
+
+fn classify_content<'a>(
+    sections: &[KindleSection],
+    resources: &'a [KindleResource],
+) -> (
+    ResourceIndex<'a>,
+    SectionIndex,
+    super::css_flow::CssResourceIndex<'a>,
+    Option<u32>,
+) {
+    let resource_index = ResourceIndex::new(resources);
+    let section_lookup = SectionIndex::new(sections);
+    let css_resources = referenced_css_resources(sections, &resource_index, &section_lookup);
     let layout_flow_number = u32::try_from(css_resources.len())
         .ok()
         .and_then(|count| count.checked_add(1));
-    let mut sections = std::mem::take(sections)
-        .into_iter()
-        .enumerate()
-        .map(|(index, section)| -> Result<KindleSection> {
-            let source = rewrite_layout_class_for_document(
-                &section.source_xhtml,
-                index,
-                section_has_explicit_layout(&section, resources),
-            );
-            let source = rewrite_stylesheet_links_with_references(
-                source,
-                &section.href,
-                &css_resources,
-                Some(&section.referenced_styles),
-            );
-            let source = if source.contains("kf8-layout") {
-                if let Some(flow_number) = layout_flow_number {
-                    rewrite_layout_fallback_link(&source, flow_number)
-                } else {
-                    source
-                }
+    (
+        resource_index,
+        section_lookup,
+        css_resources,
+        layout_flow_number,
+    )
+}
+
+fn project_style_and_resources(
+    sections: &mut Vec<KindleSection>,
+    resource_index: &ResourceIndex<'_>,
+    css_resources: &super::css_flow::CssResourceIndex<'_>,
+    layout_flow_number: Option<u32>,
+    cover_resource_id: Option<&str>,
+) -> Result<(Vec<KindleSection>, bool)> {
+    let mut projected = Vec::with_capacity(sections.len());
+    let mut uses_generated_layout = false;
+    for (index, section) in std::mem::take(sections).into_iter().enumerate() {
+        let has_explicit_layout = section_has_explicit_layout(&section, resource_index);
+        let layout_rewrite =
+            rewrite_layout_class_for_document(section.source_xhtml, index, has_explicit_layout);
+        uses_generated_layout |= layout_rewrite.uses_generated_layout;
+        let source = layout_rewrite.source;
+        let source = rewrite_stylesheet_links_with_references(
+            source,
+            &section.href,
+            &css_resources,
+            Some(&section.referenced_styles),
+        );
+        let source = if layout_rewrite.uses_generated_layout {
+            if let Some(flow_number) = layout_flow_number {
+                rewrite_layout_fallback_link(source, flow_number)
             } else {
                 source
-            };
-            let source = rewrite_section_assets(source, &section.href, resources)?;
-            let source = super::rawml::rewrite_cover_landmark_reference(
-                source,
-                &section.href,
-                cover_resource_id,
-                resources,
-            )?;
-            let source_xhtml = super::rawml::materialize_ordered_list_values(&source)?;
-            Ok(KindleSection {
-                id: section.id,
-                href: section.href,
-                source_xhtml,
-                referenced_styles: section.referenced_styles,
-                linear: section.linear,
-                layout: section.layout,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let generated_layout_flow = sections
-        .iter()
-        .any(|section| section.source_xhtml.contains("kf8-layout"));
+            }
+        } else {
+            source
+        };
+        let source = rewrite_projected_attributes(
+            source,
+            &section.href,
+            cover_resource_id,
+            &resource_index,
+        )?;
+        projected.push(KindleSection {
+            id: section.id,
+            href: section.href,
+            source_xhtml: source,
+            referenced_styles: section.referenced_styles,
+            linear: section.linear,
+            layout: section.layout,
+            rendition: section.rendition,
+            source_properties: section.source_properties,
+            source_spine_index: section.source_spine_index,
+        });
+    }
+    Ok((projected, uses_generated_layout))
+}
+
+fn normalize_structural_content(
+    mut sections: Vec<KindleSection>,
+    css_resources: &super::css_flow::CssResourceIndex<'_>,
+    uses_generated_layout: bool,
+) -> Result<(Vec<KindleSection>, Vec<Vec<u8>>)> {
+    for section in &mut sections {
+        let source = std::mem::take(&mut section.source_xhtml);
+        section.source_xhtml = super::rawml::materialize_ordered_list_values(source)?;
+    }
     let page_flow_start = css_resources
         .len()
-        .checked_add(usize::from(generated_layout_flow))
+        .checked_add(usize::from(uses_generated_layout))
         .and_then(|count| count.checked_add(1))
         .and_then(|count| u32::try_from(count).ok())
         .ok_or_else(|| crate::error::Error::Output("page flow number overflow".to_owned()))?;
@@ -237,7 +306,7 @@ fn prepare_content<'a>(
             to_base32_fixed(flow_number, 4)?
         );
         let css_reference = section.referenced_styles.iter().find_map(|style_href| {
-            super::css_flow::css_flow_number(&section.href, style_href, &css_resources)
+            super::css_flow::css_flow_number(&section.href, style_href, css_resources)
                 .map(super::css_flow::stylesheet_flow_reference)
         });
         let Some((source_xhtml, page_flow)) = lower_pre_paginated_section(
@@ -253,42 +322,53 @@ fn prepare_content<'a>(
         section.source_xhtml = source_xhtml;
         page_flows.push(page_flow);
     }
-    let mut next_aid = 0u32;
-    for section in &mut sections {
-        section.source_xhtml = assign_aids(&section.source_xhtml, &mut next_aid)?;
-    }
-    let mut pending_links = Vec::with_capacity(sections.len());
-    for section_index in 0..sections.len() {
-        let source = std::mem::take(&mut sections[section_index].source_xhtml);
-        let (source, links) = rewrite_internal_links(
-            source,
-            &sections[section_index].href,
-            section_index,
-            &sections,
-            &css_resources,
-        )?;
-        sections[section_index].source_xhtml = source;
-        pending_links.push(links);
-    }
-    Ok(PreparedContent {
-        sections,
-        css_resources,
-        page_flows,
-        pending_links,
-        library_thumbnail,
-    })
+    Ok((sections, page_flows))
 }
 
-fn build_geometry(
-    book: &KindleBook,
-    resources: &[KindleResource],
-    prepared: PreparedContent<'_>,
-) -> Result<TextGeometry> {
+fn assign_positioning_metadata(sections: &mut [KindleSection]) -> Result<Vec<AnchorIndex>> {
+    let mut next_aid = 0u32;
+    let mut anchor_indices = Vec::with_capacity(sections.len());
+    for section in &mut *sections {
+        let source = std::mem::take(&mut section.source_xhtml);
+        let assignment = assign_aids(source, &mut next_aid)?;
+        section.source_xhtml = assignment.xhtml;
+        anchor_indices.push(assignment.anchors);
+    }
+    Ok(anchor_indices)
+}
+
+fn prepare_link_materialization(
+    sections: &mut [KindleSection],
+    section_lookup: &SectionIndex,
+    anchor_indices: &[AnchorIndex],
+    css_resources: &super::css_flow::CssResourceIndex<'_>,
+) -> Result<Vec<Vec<PendingInternalLink>>> {
+    let mut pending_links = Vec::with_capacity(sections.len());
+    for section_number in 0..sections.len() {
+        let source = std::mem::take(&mut sections[section_number].source_xhtml);
+        let (source, links) = rewrite_internal_links(
+            source,
+            &sections[section_number].href,
+            section_lookup,
+            section_number,
+            anchor_indices,
+            css_resources,
+        )?;
+        sections[section_number].source_xhtml = source;
+        pending_links.push(links);
+    }
+    Ok(pending_links)
+}
+
+fn build_geometry(book: &KindleBook, prepared: PreparedContent<'_>) -> Result<TextGeometry> {
     let PreparedContent {
         sections,
+        resource_index,
         css_resources,
+        section_index,
         page_flows,
         pending_links,
+        uses_generated_layout,
         library_thumbnail,
     } = prepared;
     let mut section_parts = sections
@@ -303,20 +383,18 @@ fn build_geometry(
         &position_map,
         &mut section_parts,
     )?;
+    drop(pending_links);
     let mut css_flows = Vec::with_capacity(css_resources.len() + 1);
-    for resource in &css_resources {
-        let css_base_href = css_resource_base_href(&sections, resource);
+    for &resource in &css_resources.resources {
+        let css_base_href = css_resource_base_href(&section_index, resource);
         css_flows.push(rewrite_css_assets(
             &resource.data,
             &css_base_href,
-            resources,
+            &resource_index,
             &css_resources,
         ));
     }
-    if sections
-        .iter()
-        .any(|section| section.source_xhtml.contains("kf8-layout"))
-    {
+    if uses_generated_layout {
         css_flows.push(generated_layout_css(book.layout).into_bytes());
     }
     let css_flow_lengths = css_flows.iter().map(Vec::len).collect::<Vec<_>>();
@@ -340,6 +418,9 @@ fn build_geometry(
                 .try_fold(total, |total, flow| total.checked_add(flow.len()))
         })
         .ok_or_else(|| crate::error::Error::Output("text length overflow".to_owned()))?;
+    for section in &mut sections {
+        drop(std::mem::take(&mut section.source_xhtml));
+    }
     Ok(TextGeometry {
         sections,
         section_parts,
@@ -358,6 +439,7 @@ fn assemble_records(
     palm_doc_compression: bool,
 ) -> Result<PhysicalLayout> {
     let Indexes {
+        resc_sections,
         position_map,
         text_records,
         indexing_tbs,
@@ -483,6 +565,19 @@ fn assemble_records(
         records.push(Kf8Record { data: thumbnail });
     }
 
+    // RESC follows all binary resource records and precedes FLIS/FCIS/EOF.
+    // The established MOBI header has no dedicated RESC pointer, so the
+    // first-image/resource field below remains tied to image geometry.
+    let resc_record = u32::try_from(records.len() + 1)
+        .map_err(|_| crate::error::Error::Output("RESC record index overflow".to_owned()))?;
+    records.push(Kf8Record {
+        data: encode_resc(
+            &resc_sections,
+            book.metadata.rendition,
+            book.metadata.rendition_viewport.as_deref(),
+        )?,
+    });
+
     let flis_record = u32::try_from(records.len() + 1)
         .map_err(|_| crate::error::Error::Output("FLIS record index overflow".to_owned()))?;
     records.push(Kf8Record {
@@ -510,6 +605,7 @@ fn assemble_records(
         fdst_record,
         fcis_record,
         flis_record,
+        resc_record,
         geometry,
     })
 }
@@ -530,11 +626,21 @@ fn build_record0(book: KindleBook, layout: PhysicalLayout) -> Result<Kf8Book> {
         fdst_record,
         fcis_record,
         flis_record,
+        resc_record,
         geometry,
     } = layout;
     let mut exth = ExthHeader::default();
-    if let Some(value) = &book.metadata.creator {
-        exth.push_text(100, value);
+    if book.metadata.authors.is_empty() {
+        if let Some(value) = &book.metadata.creator {
+            exth.push_text(100, value);
+        }
+    } else {
+        for value in &book.metadata.authors {
+            exth.push_text(100, value);
+        }
+    }
+    for value in &book.metadata.contributors {
+        exth.push_text(108, value);
     }
     if let Some(value) = &book.metadata.publisher {
         exth.push_text(101, value);
@@ -544,6 +650,15 @@ fn build_record0(book: KindleBook, layout: PhysicalLayout) -> Result<Kf8Book> {
     }
     if let Some(value) = &book.metadata.title {
         exth.push_text(503, value);
+    }
+    if let Some(value) = &book.metadata.title_file_as {
+        exth.push_text(508, value);
+    }
+    if let Some(value) = &book.metadata.creator_file_as {
+        exth.push_text(517, value);
+    }
+    if let Some(value) = &book.metadata.publisher_file_as {
+        exth.push_text(522, value);
     }
     if let Some(value) = &book.metadata.language {
         exth.push_text(524, value);
@@ -571,17 +686,36 @@ fn build_record0(book: KindleBook, layout: PhysicalLayout) -> Result<Kf8Book> {
     exth.push_text(527, page_progression_value(book.layout.page_progression));
     if book.metadata.is_fixed_layout {
         exth.push_text(122, "true");
-        if book
-            .metadata
-            .book_type
+        if let Some(value) = book.metadata.book_type.as_deref().map(str::trim) {
+            let value = if value.eq_ignore_ascii_case("comic") {
+                Some("comic")
+            } else if value.eq_ignore_ascii_case("children") {
+                Some("children")
+            } else {
+                None
+            };
+            if let Some(value) = value {
+                exth.push_text(123, value);
+            }
+        }
+    }
+    let orientation = if book.metadata.is_fixed_layout {
+        book.metadata
+            .orientation_lock
             .as_deref()
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("comic"))
-        {
-            exth.push_text(123, "comic");
-        }
-        if let Some(value) = &book.metadata.orientation_lock {
-            exth.push_text(124, value);
-        }
+            .or(book.metadata.orientation.as_deref())
+    } else {
+        book.metadata.orientation.as_deref()
+    };
+    if let Some(value) = orientation {
+        let value = if value.eq_ignore_ascii_case("auto") {
+            "none"
+        } else {
+            value
+        };
+        exth.push_text(124, value);
+    }
+    if book.metadata.is_fixed_layout {
         if let Some(value) = &book.metadata.original_resolution {
             exth.push_text(126, value);
         }
@@ -622,6 +756,7 @@ fn build_record0(book: KindleBook, layout: PhysicalLayout) -> Result<Kf8Book> {
         mobi,
         exth,
         title,
+        resc_record,
         records,
     })
 }
@@ -654,6 +789,8 @@ fn build_text_records(geometry: TextGeometry) -> Result<TextData> {
     let text_records = TextRecord::split_chunks(&stream_chunks);
     drop(stream_chunks);
     drop(css_flows);
+    let page_flow_lengths = page_flows.iter().map(Vec::len).collect::<Vec<_>>();
+    drop(page_flows);
     let expected_record_count = rawml_length
         .checked_add(4096 - 1)
         .ok_or_else(|| crate::error::Error::Output("text length overflow".to_owned()))?
@@ -673,23 +810,45 @@ fn build_text_records(geometry: TextGeometry) -> Result<TextData> {
             "PalmDOC text record count exceeds u16".to_owned(),
         ));
     }
-    let xhtml_length = section_parts
-        .iter()
-        .try_fold(0usize, |total, parts| -> Result<usize> {
-            let fragments_length = parts.fragments.iter().try_fold(0usize, |total, fragment| {
-                total
-                    .checked_add(fragment.len())
-                    .ok_or_else(|| crate::error::Error::Output("XHTML length overflow".to_owned()))
-            })?;
-            let section_length = parts
-                .skeleton
-                .len()
-                .checked_add(fragments_length)
-                .ok_or_else(|| crate::error::Error::Output("XHTML length overflow".to_owned()))?;
+    let mut skel_offset = 0u32;
+    let mut skel_entries = Vec::with_capacity(section_parts.len());
+    let mut xhtml_length = 0usize;
+    for parts in &section_parts {
+        let skel_start = skel_offset;
+        let skeleton_length = u32::try_from(parts.skeleton.len()).map_err(|_| {
+            crate::error::Error::Output("SKEL section length exceeds u32".to_owned())
+        })?;
+        let fragments_length = parts.fragments.iter().try_fold(0usize, |total, fragment| {
             total
-                .checked_add(section_length)
+                .checked_add(fragment.len())
                 .ok_or_else(|| crate::error::Error::Output("XHTML length overflow".to_owned()))
         })?;
+        let fragments_length_u32 = u32::try_from(fragments_length)
+            .map_err(|_| crate::error::Error::Output("SKEL position overflow".to_owned()))?;
+        let section_length = parts
+            .skeleton
+            .len()
+            .checked_add(fragments_length)
+            .ok_or_else(|| crate::error::Error::Output("XHTML length overflow".to_owned()))?;
+        xhtml_length = xhtml_length
+            .checked_add(section_length)
+            .ok_or_else(|| crate::error::Error::Output("XHTML length overflow".to_owned()))?;
+        skel_offset = skel_offset
+            .checked_add(skeleton_length)
+            .and_then(|offset| offset.checked_add(fragments_length_u32))
+            .ok_or_else(|| crate::error::Error::Output("SKEL position overflow".to_owned()))?;
+        skel_entries.push(SkelEntry {
+            fragment_count: u32::try_from(parts.fragments.len()).map_err(|_| {
+                crate::error::Error::Output("SKEL fragment count exceeds u32".to_owned())
+            })?,
+            start: skel_start,
+            length: skeleton_length,
+        });
+    }
+    let skel = Skel {
+        entries: skel_entries,
+    };
+    drop(section_parts);
     let text_length = text_records
         .iter()
         .map(|record| record.data.len())
@@ -707,14 +866,14 @@ fn build_text_records(geometry: TextGeometry) -> Result<TextData> {
     let text_record_count = text_records.len();
     Ok(TextData {
         sections,
-        section_parts,
+        skel,
         position_map,
         text_records,
         text_length_u32,
         text_record_count,
         xhtml_length_u32,
         css_flow_lengths,
-        page_flow_lengths: page_flows.iter().map(Vec::len).collect(),
+        page_flow_lengths,
         library_thumbnail,
     })
 }
@@ -722,7 +881,7 @@ fn build_text_records(geometry: TextGeometry) -> Result<TextData> {
 fn build_indexes(book: &KindleBook, text: TextData) -> Result<Indexes> {
     let TextData {
         sections,
-        section_parts,
+        skel,
         position_map,
         text_records,
         text_length_u32,
@@ -732,36 +891,6 @@ fn build_indexes(book: &KindleBook, text: TextData) -> Result<Indexes> {
         page_flow_lengths,
         library_thumbnail,
     } = text;
-    let mut offset = 0u32;
-    let skel = Skel {
-        entries: section_parts
-            .iter()
-            .map(|parts| {
-                let start = offset;
-                let length = u32::try_from(parts.skeleton.len()).map_err(|_| {
-                    crate::error::Error::Output("SKEL section length exceeds u32".to_owned())
-                })?;
-                offset = offset
-                    .checked_add(length)
-                    .and_then(|value| {
-                        value.checked_add(
-                            u32::try_from(parts.fragments.iter().map(Vec::len).sum::<usize>())
-                                .ok()?,
-                        )
-                    })
-                    .ok_or_else(|| {
-                        crate::error::Error::Output("SKEL position overflow".to_owned())
-                    })?;
-                Ok(SkelEntry {
-                    fragment_count: u32::try_from(parts.fragments.len()).map_err(|_| {
-                        crate::error::Error::Output("SKEL fragment count exceeds u32".to_owned())
-                    })?,
-                    start,
-                    length,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?,
-    };
     skel.validate()?;
     let fragments = fragments_from_position_map(&position_map);
     fragments.validate()?;
@@ -830,6 +959,7 @@ fn build_indexes(book: &KindleBook, text: TextData) -> Result<Indexes> {
         .encode_pair()
         .map_err(|error| crate::error::Error::Output(format!("Guide: {error}")))?;
     Ok(Indexes {
+        resc_sections: sections,
         position_map,
         text_records,
         indexing_tbs,
@@ -888,192 +1018,6 @@ fn language_code(language: &str) -> u32 {
     }
 }
 
-pub(crate) fn to_base32(value: u32) -> String {
-    const DIGITS: &[u8; 32] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
-    let mut value = value;
-    let mut digits = Vec::new();
-    while value != 0 {
-        digits.push(DIGITS[(value % 32) as usize]);
-        value /= 32;
-    }
-    if digits.is_empty() {
-        digits.push(b'0');
-    }
-    while digits.len() < 4 {
-        digits.push(b'0');
-    }
-    digits.reverse();
-    String::from_utf8(digits).expect("base32 alphabet is ASCII")
-}
-
-pub(crate) fn generated_section_path(index: usize) -> String {
-    format!(
-        "{GENERATED_TEXT_DIRECTORY}/{GENERATED_SECTION_PREFIX}{index:04}{GENERATED_SECTION_EXTENSION}"
-    )
-}
-
-pub(super) fn preserved_style_attributes(source: &str, start: usize, tag_end: usize) -> String {
-    let Some((_, mut cursor, closing)) = html_tag_name_range(source, start, tag_end) else {
-        return String::new();
-    };
-    if closing {
-        return String::new();
-    }
-
-    let bytes = source.as_bytes();
-    let allowed = ["media", "title", "type"];
-    let mut attributes = Vec::new();
-    while cursor < tag_end {
-        while cursor < tag_end && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        if cursor >= tag_end || bytes[cursor] == b'/' {
-            break;
-        }
-        let attribute_start = cursor;
-        while cursor < tag_end
-            && !bytes[cursor].is_ascii_whitespace()
-            && !matches!(bytes[cursor], b'=' | b'/' | b'>')
-        {
-            cursor = advance_char(source, cursor);
-        }
-        let attribute_end = cursor;
-        while cursor < tag_end && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        if attribute_start == attribute_end || bytes.get(cursor) != Some(&b'=') {
-            continue;
-        }
-        cursor += 1;
-        while cursor < tag_end && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        let Some(&value_start_byte) = bytes.get(cursor) else {
-            break;
-        };
-        let (value_start, value_end, quote) = if matches!(value_start_byte, b'"' | b'\'') {
-            let value_start = cursor + 1;
-            let Some(relative_end) = source[value_start..tag_end].find(value_start_byte as char)
-            else {
-                return String::new();
-            };
-            let value_end = value_start + relative_end;
-            cursor = value_end + 1;
-            (value_start, value_end, value_start_byte)
-        } else {
-            let value_start = cursor;
-            while cursor < tag_end && !bytes[cursor].is_ascii_whitespace() && bytes[cursor] != b'>'
-            {
-                cursor = advance_char(source, cursor);
-            }
-            let value_end = if cursor > value_start
-                && bytes[cursor - 1] == b'/'
-                && source[cursor..tag_end].trim().is_empty()
-            {
-                cursor - 1
-            } else {
-                cursor
-            };
-            (value_start, value_end, b'"')
-        };
-        if let Some(name) = allowed
-            .iter()
-            .find(|name| html_local_name_is(source, attribute_start, attribute_end, name))
-        {
-            attributes.push((*name, &source[value_start..value_end], quote));
-        }
-    }
-
-    let mut result = String::new();
-    for (name, value, quote) in attributes {
-        result.push(' ');
-        result.push_str(name);
-        result.push('=');
-        result.push(quote as char);
-        result.push_str(value);
-        result.push(quote as char);
-    }
-    result
-}
-
-pub(super) fn stylesheet_link_href(
-    source: &str,
-    start: usize,
-    tag_end: usize,
-) -> Option<(usize, usize)> {
-    let bytes = source.as_bytes();
-    let (name_start, name_end, closing) = html_tag_name_range(source, start, tag_end)?;
-    if closing || !html_local_name_is(source, name_start, name_end, "link") {
-        return None;
-    }
-    let mut cursor = name_end;
-
-    let mut has_stylesheet_rel = false;
-    let mut href = None;
-    while cursor < tag_end {
-        while cursor < tag_end && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        if cursor >= tag_end || bytes[cursor] == b'/' {
-            break;
-        }
-        let attribute_start = cursor;
-        while cursor < tag_end
-            && !bytes[cursor].is_ascii_whitespace()
-            && !matches!(bytes[cursor], b'=' | b'/' | b'>')
-        {
-            cursor = advance_char(source, cursor);
-        }
-        let attribute_end = cursor;
-        if attribute_start == attribute_end {
-            cursor = advance_char(source, cursor);
-            continue;
-        }
-        while cursor < tag_end && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        if bytes.get(cursor) != Some(&b'=') {
-            continue;
-        }
-        cursor += 1;
-        while cursor < tag_end && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        let attribute_name = &source[attribute_start..attribute_end];
-        let quote = *bytes.get(cursor)?;
-        if !matches!(quote, b'"' | b'\'') {
-            let value_start = cursor;
-            while cursor < tag_end && !bytes[cursor].is_ascii_whitespace() {
-                cursor = advance_char(source, cursor);
-            }
-            if attribute_name.eq_ignore_ascii_case("rel") {
-                has_stylesheet_rel = is_stylesheet_rel(&source[value_start..cursor]);
-            } else if attribute_name.eq_ignore_ascii_case("href") {
-                // HTML permits an unquoted attribute value. The value span
-                // remains source-relative so only a resolved stylesheet link
-                // is replaced and all surrounding bytes stay untouched.
-                href = Some((value_start, cursor));
-            }
-            continue;
-        }
-        let value_start = cursor + 1;
-        let value_end = value_start + source[value_start..tag_end].find(quote as char)?;
-        if attribute_name.eq_ignore_ascii_case("rel") {
-            has_stylesheet_rel = is_stylesheet_rel(&source[value_start..value_end]);
-        } else if attribute_name.eq_ignore_ascii_case("href") {
-            href = Some((value_start, value_end));
-        }
-        cursor = value_end + 1;
-    }
-    if has_stylesheet_rel { href } else { None }
-}
-
-fn is_stylesheet_rel(value: &str) -> bool {
-    value
-        .split_whitespace()
-        .any(|token| token.eq_ignore_ascii_case("stylesheet"))
-}
-
 fn fragments_from_position_map(position_map: &PositionMap) -> Fragment {
     // PositionMap owns the canonical document-local payload-stream offset.
     // FRAG tag 6 uses it for `start`; insert_position remains the separate
@@ -1091,14 +1035,4 @@ fn fragments_from_position_map(position_map: &PositionMap) -> Fragment {
             })
             .collect(),
     }
-}
-
-pub(crate) fn to_base32_fixed(value: u32, width: usize) -> Result<String> {
-    let encoded = to_base32(value);
-    if encoded.len() > width {
-        return Err(crate::error::Error::Output(
-            "base32 value exceeds fixed KF8 field width".to_owned(),
-        ));
-    }
-    Ok(format!("{:0>width$}", encoded, width = width))
 }

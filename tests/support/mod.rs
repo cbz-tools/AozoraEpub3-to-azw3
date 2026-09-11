@@ -2,62 +2,16 @@
 
 use std::io::{Cursor, Write};
 
-use aozoraepub3_to_azw3::{Compression, ConvertOptions, convert_bytes};
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
-pub const SOVEREIGN_EPUB: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/sovereign-stars/Sovereign_Stars_Vol_1.epub"
-);
-pub const CRIME_EPUB: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/crime-and-punishment/source.epub"
-);
-
-pub fn convert_fixture(path: &str) -> (Vec<u8>, Azw3) {
-    let input = std::fs::read(path).unwrap_or_else(|error| panic!("read {path}: {error}"));
-    let output = convert_bytes(&input, &ConvertOptions::default())
-        .unwrap_or_else(|error| panic!("convert {path}: {error}"));
-    let inspected = Azw3::parse(output.clone());
-    (input, inspected)
-}
-
-pub fn convert_epub(epub: Vec<u8>) -> Azw3 {
-    let output = convert_bytes(&epub, &ConvertOptions::default()).expect("convert recipe EPUB");
-    Azw3::parse(output)
-}
-
-pub fn convert_epub_uncompressed(epub: Vec<u8>) -> Azw3 {
-    let output = convert_bytes(
-        &epub,
-        &ConvertOptions {
-            compression: Compression::None,
-        },
-    )
-    .expect("convert recipe EPUB without PalmDOC compression");
-    Azw3::parse(output)
-}
-
-pub fn epub_text(path: &str) -> String {
-    let bytes = std::fs::read(path).unwrap_or_else(|error| panic!("read {path}: {error}"));
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("open EPUB ZIP");
-    let mut text = String::new();
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index).expect("read EPUB entry");
-        if entry.name().ends_with(".xhtml")
-            || entry.name().ends_with(".css")
-            || entry.name().ends_with(".ncx")
-            || entry.name().ends_with(".opf")
-        {
-            let mut value = String::new();
-            std::io::Read::read_to_string(&mut entry, &mut value).expect("decode EPUB text");
-            text.push_str(&value);
-        }
-    }
-    text
-}
+mod conversion;
+mod navigation;
+#[allow(unused_imports)]
+pub use conversion::*;
+#[allow(unused_imports)]
+pub use navigation::*;
 
 #[derive(Debug, Clone)]
 pub struct Azw3 {
@@ -742,81 +696,6 @@ fn read_vwi(bytes: &[u8], cursor: &mut usize) -> u32 {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum NavigationRecipe {
-    InSpine,
-    OutsideSpine,
-    LinearNo,
-    AfterBody,
-    NcxOnly,
-}
-
-pub fn navigation_recipe(recipe: NavigationRecipe) -> Vec<u8> {
-    let nav_in_spine = !matches!(
-        recipe,
-        NavigationRecipe::OutsideSpine | NavigationRecipe::NcxOnly
-    );
-    let include_nav = !matches!(recipe, NavigationRecipe::NcxOnly);
-    let linear = if matches!(recipe, NavigationRecipe::LinearNo) {
-        "no"
-    } else {
-        "yes"
-    };
-    let nav_spine = if nav_in_spine {
-        if matches!(recipe, NavigationRecipe::AfterBody) {
-            format!(
-                "<itemref idref=\"body\" linear=\"yes\"/><itemref idref=\"nav\" linear=\"{linear}\"/>"
-            )
-        } else {
-            format!(
-                "<itemref idref=\"nav\" linear=\"{linear}\"/><itemref idref=\"body\" linear=\"yes\"/>"
-            )
-        }
-    } else {
-        "<itemref idref=\"body\" linear=\"yes\"/>".to_owned()
-    };
-    let nav_manifest = if include_nav {
-        "<item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" properties=\"nav\"/>"
-    } else {
-        ""
-    };
-    let bodymatter_landmark = if matches!(recipe, NavigationRecipe::LinearNo) {
-        ""
-    } else {
-        "<li><a epub:type=\"bodymatter\" href=\"body.xhtml\">Body</a></li>"
-    };
-    let nav_file = if include_nav {
-        let nav = format!(
-            r#"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body><nav epub:type="toc"><ol><li><a href="body.xhtml">Visible <span>TOC</span></a><ol><li><a href="body.xhtml#detail">Detail</a></li></ol></li></ol></nav><nav epub:type="landmarks"><ol>{bodymatter_landmark}</ol></nav></body></html>"#
-        );
-        Some(("nav.xhtml", nav.into_bytes()))
-    } else {
-        None
-    };
-    let ncx_manifest = if matches!(recipe, NavigationRecipe::NcxOnly) {
-        "<item id=\"ncx\" href=\"toc.ncx\" media-type=\"application/x-dtbncx+xml\"/>"
-    } else {
-        ""
-    };
-    let package = format!(
-        r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Recipe Navigation</dc:title><dc:creator>Fixture Author</dc:creator><dc:language>en</dc:language></metadata><manifest><item id="style" href="style.css" media-type="text/css"/><item id="body" href="body.xhtml" media-type="application/xhtml+xml"/>{nav_manifest}{ncx_manifest}</manifest><spine page-progression-direction="ltr">{nav_spine}</spine></package>"#
-    );
-    let ncx = br#"<?xml version="1.0"?><ncx><navMap><navPoint><navLabel><text>NCX Visible</text></navLabel><content src="body.xhtml"/></navPoint></navMap></ncx>"#;
-    let body = br##"<html class="hltr" xmlns="http://www.w3.org/1999/xhtml"><head><link rel="stylesheet" href="style.css"/></head><body><h1 id="detail">Body semantic marker</h1><p><a href="#detail">Self</a> <a href="https://www.google.com/">Google</a></p></body></html>"##;
-    zip_epub(
-        &package,
-        &[
-            (
-                "style.css",
-                b"body { writing-mode: horizontal-tb; }".to_vec(),
-            ),
-            ("body.xhtml", body.to_vec()),
-            ("toc.ncx", ncx.to_vec()),
-        ],
-        nav_file,
-    )
-}
-
-#[derive(Debug, Clone, Copy)]
 pub struct CoverRecipe {
     pub cover_page: bool,
     pub cover_navigation: bool,
@@ -1034,7 +913,11 @@ fn jpeg(width: u32, height: u32, color: [u8; 4]) -> Vec<u8> {
     output.into_inner()
 }
 
-fn zip_epub(package: &str, files: &[(&str, Vec<u8>)], extra: Option<(&str, Vec<u8>)>) -> Vec<u8> {
+pub fn zip_epub(
+    package: &str,
+    files: &[(&str, Vec<u8>)],
+    extra: Option<(&str, Vec<u8>)>,
+) -> Vec<u8> {
     let mut output = Cursor::new(Vec::new());
     let mut zip = ZipWriter::new(&mut output);
     let stored = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);

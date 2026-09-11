@@ -1,4 +1,4 @@
-use crate::book::{Direction, PageProgression, WritingMode};
+use crate::book::{Direction, PageProgression, RenditionSemantics, WritingMode};
 
 #[derive(Debug, Clone)]
 pub struct KindleBook {
@@ -27,6 +27,8 @@ pub(crate) type KindleWritingMode = WritingMode;
 pub struct KindleMetadata {
     pub title: Option<String>,
     pub creator: Option<String>,
+    pub authors: Vec<String>,
+    pub contributors: Vec<String>,
     pub language: Option<String>,
     // Semantic metadata is retained in the Kindle IR even though the current
     // minimal EXTH policy deliberately does not serialize an identifier.
@@ -42,6 +44,13 @@ pub struct KindleMetadata {
     pub orientation: Option<String>,
     pub orientation_lock: Option<String>,
     pub original_resolution: Option<String>,
+    pub rendition_viewport: Option<String>,
+    pub title_file_as: Option<String>,
+    pub creator_file_as: Option<String>,
+    pub publisher_file_as: Option<String>,
+    /// Typed publication-level rendition semantics consumed by RESC metadata
+    /// projection. Item-level rendition stays on each `KindleSection`.
+    pub rendition: RenditionSemantics,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +70,11 @@ pub struct KindleSection {
     pub referenced_styles: Vec<String>,
     pub linear: bool,
     pub layout: KindleLayoutSemantic,
+    pub rendition: RenditionSemantics,
+    /// Original EPUB spine itemref properties retained for RESC serialization.
+    pub source_properties: Vec<String>,
+    /// Source spine position; `None` identifies a synthetic Kindle section.
+    pub source_spine_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

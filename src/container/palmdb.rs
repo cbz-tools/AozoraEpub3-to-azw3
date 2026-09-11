@@ -65,12 +65,6 @@ impl PalmDb {
         Ok(self.encode_unchecked())
     }
 
-    #[allow(dead_code)]
-    pub fn write_checked<W: Write>(&self, writer: &mut W, path: &str) -> crate::error::Result<()> {
-        self.validate()?;
-        self.write_unchecked(writer, path)
-    }
-
     pub(crate) fn write_stream_checked<W: Write, I>(
         name: &str,
         record_lengths: &[usize],

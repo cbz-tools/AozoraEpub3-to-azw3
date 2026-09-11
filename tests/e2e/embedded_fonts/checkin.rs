@@ -1,10 +1,10 @@
-mod support;
+//! Primary audit coverage: E-12.
 
 use std::io::{Cursor, Read};
 
+use crate::support::{Azw3, convert_epub};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
-use support::{Azw3, convert_epub};
 use zip::ZipArchive;
 
 const EMBEDDED_FONT_EPUB: &str = concat!(
@@ -26,8 +26,12 @@ struct ManifestItem {
     media_type: String,
 }
 
+// E2E-ID: E2E-FONT-01
+// Audit: E-12
 #[test]
 fn embedded_font_is_preserved_as_a_resolvable_kf8_resource() {
+    // Audit coverage: E-12 and G6-20/G7-13. This is the dedicated FONT path;
+    // it does not establish conditional E-13 generic-resource coverage.
     let epub = std::fs::read(EMBEDDED_FONT_EPUB).expect("read embedded-font EPUB");
     let mut archive = ZipArchive::new(Cursor::new(epub.clone())).expect("open embedded-font EPUB");
 
@@ -136,8 +140,13 @@ fn embedded_font_is_preserved_as_a_resolvable_kf8_resource() {
     );
     let resource_record_start = mobi
         .flis
-        .checked_sub(binary_resource_count)
+        .checked_sub(binary_resource_count + 1)
         .expect("E-12 resource records precede FLIS");
+    assert_eq!(
+        resource_record_start + binary_resource_count,
+        azw3.record_with_magic(b"RESC").expect("RESC record"),
+        "E-12 resource range is followed by RESC before FLIS"
+    );
     let embed_base = if mobi.first_image == u32::MAX as usize {
         resource_record_start
     } else {

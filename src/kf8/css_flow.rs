@@ -4,73 +4,241 @@
 //! rewriting, and flow references. XHTML semantic parsing and KF8 record
 //! serialization remain outside this boundary.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
-use super::builder::{SYNTHETIC_INLINE_CSS_PROPERTY, to_base32, to_base32_fixed};
+use super::format::{to_base32, to_base32_fixed};
 use super::resource::{is_binary_resource, is_css_resource, is_font_resource, is_image_resource};
+use crate::css::{
+    SYNTHETIC_INLINE_CSS_PROPERTY, advance_css_char, css_function_at, css_import_spans,
+    css_import_targets, skip_css_comment, skip_css_space_comments, skip_css_string,
+    traverse_css_dependencies,
+};
 use crate::kindle::{KindleResource as Resource, KindleSection};
-use crate::xhtml::path::{is_external_reference, normalize_path, resolve_path};
+use crate::xhtml::path::{normalize_path, resolve_path};
+
+#[derive(Debug)]
+pub(crate) struct ResourceIndex<'a> {
+    resources: &'a [Resource],
+    by_id: HashMap<String, usize>,
+    by_href: HashMap<String, Vec<usize>>,
+    binary_by_href: HashMap<String, usize>,
+    binary_resources: Vec<usize>,
+    first_image_by_binary: Vec<Option<usize>>,
+}
+
+impl<'a> ResourceIndex<'a> {
+    pub(crate) fn new(resources: &'a [Resource]) -> Self {
+        let mut by_id = HashMap::new();
+        let mut by_href: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut binary_by_href = HashMap::new();
+        let mut binary_resources = Vec::new();
+        let mut first_image_by_binary = Vec::new();
+        let mut first_image = None;
+        for (index, resource) in resources.iter().enumerate() {
+            by_id.entry(resource.id.clone()).or_insert(index);
+            if let Some(href) = normalize_path(&resource.href) {
+                by_href.entry(href).or_default().push(index);
+            }
+            if is_binary_resource(resource) {
+                let binary_index = binary_resources.len();
+                if let Some(href) = normalize_path(&resource.href) {
+                    binary_by_href.entry(href).or_insert(binary_index);
+                }
+                binary_resources.push(index);
+                if first_image.is_none() && is_image_resource(resource) {
+                    first_image = Some(binary_index);
+                }
+                first_image_by_binary.push(first_image);
+            }
+        }
+        Self {
+            resources,
+            by_id,
+            by_href,
+            binary_by_href,
+            binary_resources,
+            first_image_by_binary,
+        }
+    }
+
+    pub(crate) fn by_id(&self, id: &str) -> Option<&'a Resource> {
+        self.by_id
+            .get(id)
+            .and_then(|&index| self.resources.get(index))
+    }
+
+    pub(crate) fn first_css(&self, normalized_href: &str) -> Option<&'a Resource> {
+        self.by_href
+            .get(normalized_href)?
+            .iter()
+            .find_map(|&index| {
+                let resource = self.resources.get(index)?;
+                is_css_resource(resource).then_some(resource)
+            })
+    }
+
+    pub(crate) fn any_css(
+        &self,
+        normalized_href: &str,
+        mut predicate: impl FnMut(&Resource) -> bool,
+    ) -> bool {
+        self.by_href
+            .get(normalized_href)
+            .into_iter()
+            .flatten()
+            .filter_map(|&index| self.resources.get(index))
+            .filter(|resource| is_css_resource(resource))
+            .any(|resource| predicate(resource))
+    }
+
+    fn resource_reference(&self, base_href: &str, target: &str) -> Option<String> {
+        let resolved = resolve_path(base_href, target)?;
+        let mut matching_binary_index = None;
+        for candidate_start in std::iter::once(0).chain(
+            resolved
+                .as_bytes()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, byte)| (*byte == b'/').then_some(index + 1)),
+        ) {
+            let candidate = &resolved[candidate_start..];
+            let Some(&binary_index) = self.binary_by_href.get(candidate) else {
+                continue;
+            };
+            if matching_binary_index.is_none_or(|current| binary_index < current) {
+                matching_binary_index = Some(binary_index);
+            }
+        }
+        let binary_index = matching_binary_index?;
+        let resource = self
+            .binary_resources
+            .get(binary_index)
+            .and_then(|&index| self.resources.get(index))?;
+        let embed_index = match self.first_image_by_binary[binary_index] {
+            Some(first_image) if binary_index >= first_image => binary_index - first_image + 1,
+            Some(_) => return None,
+            None if is_font_resource(resource) => binary_index + 1,
+            None => return None,
+        };
+        Some(format!(
+            "kindle:embed:{}?mime={}",
+            to_base32(u32::try_from(embed_index).ok()?),
+            resource.media_type
+        ))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct SectionIndex {
+    by_href: HashMap<String, usize>,
+    css_bases: HashMap<String, String>,
+    section_count: usize,
+}
+
+impl SectionIndex {
+    pub(crate) fn new(sections: &[KindleSection]) -> Self {
+        let mut by_href = HashMap::new();
+        let mut css_bases = HashMap::new();
+        for (section_index, section) in sections.iter().enumerate() {
+            if let Some(href) = normalize_path(&section.href) {
+                by_href.entry(href).or_insert(section_index);
+            }
+            for style_href in &section.referenced_styles {
+                if let Some(resolved) = resolve_path(&section.href, style_href) {
+                    css_bases
+                        .entry(resolved)
+                        .or_insert_with(|| section.href.clone());
+                }
+            }
+        }
+        Self {
+            by_href,
+            css_bases,
+            section_count: sections.len(),
+        }
+    }
+
+    pub(crate) fn resolve(&self, section_href: &str, target_path: &str) -> Option<usize> {
+        let target = if target_path == section_href {
+            normalize_path(target_path)?
+        } else {
+            resolve_path(section_href, target_path)?
+        };
+        self.by_href.get(&target).copied()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.section_count
+    }
+
+    fn css_base_href(&self, normalized_resource_href: &str) -> Option<&str> {
+        self.css_bases
+            .get(normalized_resource_href)
+            .map(String::as_str)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CssResourceIndex<'a> {
+    pub(crate) resources: Vec<&'a Resource>,
+    by_href: HashMap<String, u32>,
+}
+
+impl<'a> CssResourceIndex<'a> {
+    fn new(resources: Vec<&'a Resource>) -> Self {
+        let mut by_href = HashMap::new();
+        for (index, resource) in resources.iter().enumerate() {
+            if let Some(href) = normalize_path(&resource.href) {
+                if let Ok(index) = u32::try_from(index + 1) {
+                    by_href.entry(href).or_insert(index);
+                }
+            }
+        }
+        Self { resources, by_href }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.resources.len()
+    }
+
+    pub(crate) fn flow_number(&self, resolved_href: &str) -> Option<u32> {
+        self.by_href.get(resolved_href).copied()
+    }
+}
 
 pub(crate) fn referenced_css_resources<'a>(
     sections: &[KindleSection],
-    source_resources: &'a [Resource],
-) -> Vec<&'a Resource> {
-    let mut referenced = HashSet::new();
-    let mut result = Vec::new();
-    for section in sections {
-        for style_href in &section.referenced_styles {
-            visit_css_resource(
-                sections,
-                source_resources,
-                &section.href,
-                style_href,
-                &mut referenced,
-                &mut result,
-            );
-        }
-    }
-    result
+    resource_index: &ResourceIndex<'a>,
+    section_index: &SectionIndex,
+) -> CssResourceIndex<'a> {
+    let roots = sections
+        .iter()
+        .flat_map(|section| {
+            section
+                .referenced_styles
+                .iter()
+                .map(|reference| (section.href.clone(), reference.clone()))
+        })
+        .collect::<Vec<_>>();
+    let resolved = traverse_css_dependencies(roots, |base_href, reference| {
+        let resolved = resolve_path(base_href, reference)?;
+        let resource = resource_index.first_css(&resolved)?;
+        let css = std::str::from_utf8(&resource.data)
+            .expect("EPUB CSS resources are normalized to UTF-8");
+        Some((
+            resolved,
+            css_resource_base_href(section_index, resource),
+            css_import_targets(css),
+        ))
+    });
+    let resources = resolved
+        .into_iter()
+        .filter_map(|href| resource_index.first_css(&href))
+        .collect();
+    CssResourceIndex::new(resources)
 }
 
-fn visit_css_resource<'a>(
-    sections: &[KindleSection],
-    source_resources: &'a [Resource],
-    base_href: &str,
-    style_href: &str,
-    referenced: &mut HashSet<String>,
-    result: &mut Vec<&'a Resource>,
-) {
-    let Some(resolved) = resolve_path(base_href, style_href) else {
-        return;
-    };
-    if !referenced.insert(resolved.clone()) {
-        return;
-    }
-    let Some(resource) = source_resources.iter().find(|resource| {
-        is_css_resource(resource)
-            && normalize_path(&resource.href).is_some_and(|href| href == resolved)
-    }) else {
-        return;
-    };
-    // DFS follows each source's imports in source order. Push after visiting
-    // imports so dependencies receive stable flow IDs before their parents;
-    // the set prevents shared resources and cycles from producing duplicates.
-    let imports = css_import_targets(&String::from_utf8_lossy(&resource.data));
-    let import_base_href = css_resource_base_href(sections, resource);
-    for target in imports {
-        visit_css_resource(
-            sections,
-            source_resources,
-            &import_base_href,
-            &target,
-            referenced,
-            result,
-        );
-    }
-    result.push(resource);
-}
-
-pub(crate) fn css_resource_base_href(sections: &[KindleSection], resource: &Resource) -> String {
+pub(crate) fn css_resource_base_href(section_index: &SectionIndex, resource: &Resource) -> String {
     let Some(normalized_resource_href) = normalize_path(&resource.href) else {
         return resource.href.clone();
     };
@@ -84,23 +252,17 @@ pub(crate) fn css_resource_base_href(sections: &[KindleSection], resource: &Reso
     }
 
     let resource_href = normalized_resource_href.as_str();
-    sections
-        .iter()
-        .find(|section| {
-            section.referenced_styles.iter().any(|style_href| {
-                resolve_path(&section.href, style_href)
-                    .is_some_and(|resolved| resolved == resource_href)
-            })
-        })
-        .map(|section| section.href.clone())
+    section_index
+        .css_base_href(resource_href)
+        .map(str::to_owned)
         .unwrap_or_else(|| resource.href.clone())
 }
 
 pub(crate) fn rewrite_css_assets(
     source: &[u8],
     css_href: &str,
-    resources: &[Resource],
-    css_resources: &[&Resource],
+    resources: &ResourceIndex<'_>,
+    css_resources: &CssResourceIndex<'_>,
 ) -> Vec<u8> {
     let Ok(source) = std::str::from_utf8(source) else {
         // Invalid CSS cannot be scanned safely as text. Preserve its raw
@@ -108,11 +270,19 @@ pub(crate) fn rewrite_css_assets(
         return source.to_vec();
     };
     let source = rewrite_css_imports(source, css_href, css_resources);
+    rewrite_css_urls(&source, css_href, resources).into_bytes()
+}
+
+pub(crate) fn rewrite_css_urls(
+    source: &str,
+    css_href: &str,
+    resources: &ResourceIndex<'_>,
+) -> String {
     let mut result = String::with_capacity(source.len());
     let mut cursor = 0;
-    for url in css_url_spans(&source) {
+    for url in css_url_spans(source) {
         let target = &source[url.target_start..url.target_end];
-        let Some(reference) = resource_reference(css_href, target, resources) else {
+        let Some(reference) = resources.resource_reference(css_href, target) else {
             continue;
         };
         result.push_str(&source[cursor..url.start]);
@@ -131,7 +301,7 @@ pub(crate) fn rewrite_css_assets(
         cursor = url.close_end;
     }
     result.push_str(&source[cursor..]);
-    result.into_bytes()
+    result
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -142,15 +312,6 @@ struct CssUrlSpan {
     close_end: usize,
     quote: Option<u8>,
     preserve_wrappers: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct CssImportSpan {
-    wrapper_start: usize,
-    wrapper_end: usize,
-    target_start: usize,
-    target_end: usize,
-    scan_end: usize,
 }
 
 fn css_url_spans(source: &str) -> Vec<CssUrlSpan> {
@@ -239,7 +400,11 @@ fn parse_css_url_span(source: &str, start: usize) -> Option<CssUrlSpan> {
     })
 }
 
-fn rewrite_css_imports(source: &str, css_href: &str, css_resources: &[&Resource]) -> String {
+fn rewrite_css_imports(
+    source: &str,
+    css_href: &str,
+    css_resources: &CssResourceIndex<'_>,
+) -> String {
     let mut result = String::with_capacity(source.len());
     let mut cursor = 0;
     for import in css_import_spans(source) {
@@ -261,202 +426,12 @@ fn rewrite_css_imports(source: &str, css_href: &str, css_resources: &[&Resource]
     result
 }
 
-fn css_import_spans(source: &str) -> Vec<CssImportSpan> {
-    let bytes = source.as_bytes();
-    let mut spans = Vec::new();
-    let mut cursor = 0;
-    while cursor < bytes.len() {
-        if bytes[cursor] == b'/' && bytes.get(cursor + 1) == Some(&b'*') {
-            cursor = skip_css_comment(source, cursor).unwrap_or(bytes.len());
-            continue;
-        }
-        if matches!(bytes[cursor], b'\'' | b'\"') {
-            cursor = skip_css_string(source, cursor).unwrap_or(bytes.len());
-            continue;
-        }
-        if css_keyword_at(source, cursor, "@import") {
-            if let Some(span) = parse_css_import_span(source, cursor + "@import".len()) {
-                cursor = span.scan_end;
-                spans.push(span);
-                continue;
-            }
-        }
-        cursor = advance_css_char(source, cursor);
-    }
-    spans
-}
-
-fn parse_css_import_span(source: &str, start: usize) -> Option<CssImportSpan> {
-    let (cursor, _) = skip_css_space_comments(source, start)?;
-    if css_function_at(source, cursor, "url") && source.as_bytes().get(cursor + 3) == Some(&b'(') {
-        let url = parse_css_url_span(source, cursor)?;
-        return Some(CssImportSpan {
-            wrapper_start: cursor,
-            wrapper_end: url.close_end,
-            target_start: url.target_start,
-            target_end: url.target_end,
-            scan_end: url.close_end,
-        });
-    }
-    let quote = *source.as_bytes().get(cursor)?;
-    if !matches!(quote, b'\'' | b'\"') {
-        return None;
-    }
-    let quote_end = skip_css_string(source, cursor)?;
-    Some(CssImportSpan {
-        wrapper_start: cursor,
-        wrapper_end: quote_end,
-        target_start: cursor + 1,
-        target_end: quote_end.checked_sub(1)?,
-        scan_end: quote_end,
-    })
-}
-
-fn skip_css_space_comments(source: &str, mut cursor: usize) -> Option<(usize, bool)> {
-    let mut skipped = false;
-    loop {
-        while source
-            .as_bytes()
-            .get(cursor)
-            .is_some_and(|byte| byte.is_ascii_whitespace())
-        {
-            cursor += 1;
-            skipped = true;
-        }
-        if source.as_bytes().get(cursor) == Some(&b'/')
-            && source.as_bytes().get(cursor + 1) == Some(&b'*')
-        {
-            skipped = true;
-            cursor = skip_css_comment(source, cursor)?;
-            continue;
-        }
-        return Some((cursor, skipped));
-    }
-}
-
-fn skip_css_comment(source: &str, start: usize) -> Option<usize> {
-    let bytes = source.as_bytes();
-    if bytes.get(start) != Some(&b'/') || bytes.get(start + 1) != Some(&b'*') {
-        return None;
-    }
-    let mut cursor = start + 2;
-    while cursor < bytes.len() {
-        if bytes[cursor] == b'*' && bytes.get(cursor + 1) == Some(&b'/') {
-            return Some(cursor + 2);
-        }
-        cursor = advance_css_char(source, cursor);
-    }
-    None
-}
-
-fn skip_css_string(source: &str, start: usize) -> Option<usize> {
-    let quote = *source.as_bytes().get(start)?;
-    if !matches!(quote, b'\'' | b'\"') {
-        return None;
-    }
-    let mut cursor = start + 1;
-    while cursor < source.len() {
-        match source.as_bytes()[cursor] {
-            byte if byte == quote => return Some(cursor + 1),
-            b'\\' => {
-                cursor = advance_css_char(source, cursor);
-                if cursor < source.len() {
-                    cursor = advance_css_char(source, cursor);
-                }
-            }
-            _ => cursor = advance_css_char(source, cursor),
-        }
-    }
-    None
-}
-
-pub(crate) fn advance_css_char(source: &str, cursor: usize) -> usize {
-    source
-        .get(cursor..)
-        .and_then(|remaining| remaining.chars().next())
-        .map_or(source.len(), |character| cursor + character.len_utf8())
-}
-
-fn css_keyword_at(source: &str, start: usize, keyword: &str) -> bool {
-    let bytes = source.as_bytes();
-    let end = match start.checked_add(keyword.len()) {
-        Some(end) if end <= bytes.len() => end,
-        _ => return false,
-    };
-    if !bytes[start..end]
-        .iter()
-        .zip(keyword.bytes())
-        .all(|(actual, expected)| actual.eq_ignore_ascii_case(&expected))
-    {
-        return false;
-    }
-    source
-        .get(end..)
-        .and_then(|remaining| remaining.chars().next())
-        .is_none_or(|character| {
-            !character.is_alphanumeric() && character != '_' && character != '-'
-        })
-}
-
-fn css_function_at(source: &str, start: usize, name: &str) -> bool {
-    // A CSS function name is an identifier token. Keep myurl(...) intact:
-    // splitting the suffix "url(...)" would rewrite text that is not a URL.
-    css_keyword_at(source, start, name) && css_identifier_boundary_before(source, start)
-}
-
-fn css_identifier_boundary_before(source: &str, start: usize) -> bool {
-    source
-        .get(..start)
-        .and_then(|prefix| prefix.chars().next_back())
-        .is_none_or(|character| {
-            !character.is_alphanumeric() && character != '_' && character != '-'
-        })
-}
-
-fn css_import_targets(source: &str) -> Vec<String> {
-    css_import_spans(source)
-        .into_iter()
-        .map(|span| source[span.target_start..span.target_end].to_owned())
-        .filter(|target| !is_external_reference(target))
-        .collect()
-}
-
 pub(crate) fn resource_reference(
     base_href: &str,
     target: &str,
-    resources: &[Resource],
+    resources: &ResourceIndex<'_>,
 ) -> Option<String> {
-    let resolved = resolve_path(base_href, target)?;
-    let mut first_image = None;
-    for (binary_index, resource) in resources
-        .iter()
-        .filter(|resource| is_binary_resource(resource))
-        .enumerate()
-    {
-        if first_image.is_none() && is_image_resource(resource) {
-            first_image = Some(binary_index);
-        }
-        let matches = normalize_path(&resource.href).is_some_and(|href| {
-            href == resolved
-                || resolved
-                    .strip_suffix(&href)
-                    .is_some_and(|prefix| prefix.ends_with('/'))
-        });
-        if matches {
-            let embed_index = match first_image {
-                Some(first_image) if binary_index >= first_image => binary_index - first_image + 1,
-                Some(_) => return None,
-                None if is_font_resource(resource) => binary_index + 1,
-                None => return None,
-            };
-            return Some(format!(
-                "kindle:embed:{}?mime={}",
-                to_base32(u32::try_from(embed_index).ok()?),
-                resource.media_type
-            ));
-        }
-    }
-    None
+    resources.resource_reference(base_href, target)
 }
 
 pub(crate) fn stylesheet_flow_reference(flow_number: u32) -> String {
@@ -469,11 +444,8 @@ pub(crate) fn stylesheet_flow_reference(flow_number: u32) -> String {
 pub(crate) fn css_flow_number(
     base_href: &str,
     target: &str,
-    css_resources: &[&Resource],
+    css_resources: &CssResourceIndex<'_>,
 ) -> Option<u32> {
     let resolved = resolve_path(base_href, target)?;
-    let index = css_resources
-        .iter()
-        .position(|resource| normalize_path(&resource.href).is_some_and(|href| href == resolved))?;
-    u32::try_from(index.checked_add(1)?).ok()
+    css_resources.flow_number(&resolved)
 }

@@ -13,7 +13,11 @@ use quick_xml::events::{BytesStart, Event};
 use super::navigation::split_link_suffix;
 use super::package::resolve_href;
 use super::xhtml::{is_primary_writing_mode_meta, parse_writing_mode};
-use crate::book::{Metadata, PageProgression, SemanticDocument, WritingMode};
+use crate::book::{
+    CollectionMetadata, CreatorMetadata, Metadata, MetadataRecord, PageProgression, PageSpread,
+    RenditionAlign, RenditionFlow, RenditionOrientation, RenditionSemantics, RenditionSpread,
+    SemanticDocument, WritingMode,
+};
 use crate::error::{Error, Result};
 use crate::xhtml::path::normalize_path_lossy as normalize_path;
 #[derive(Debug, Clone)]
@@ -22,6 +26,8 @@ pub(super) struct ManifestItem {
     pub(super) href: String,
     pub(super) media_type: String,
     pub(super) properties: Vec<String>,
+    pub(super) fallback: Option<String>,
+    pub(super) media_overlay: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -51,7 +57,9 @@ pub(super) struct SpineItem {
     pub(super) idref: String,
     pub(super) linear: bool,
     pub(super) properties: Vec<String>,
+    pub(super) media_overlay: Option<String>,
     pub(super) layout: SpineLayout,
+    pub(super) rendition: RenditionSemantics,
 }
 
 #[derive(Debug, Default)]
@@ -63,6 +71,8 @@ pub(super) struct ParsedOpf {
     pub(super) page_progression: PageProgression,
     pub(super) primary_writing_mode: Option<WritingMode>,
     pub(super) ncx_id: Option<String>,
+    pub(super) unique_identifier_id: Option<String>,
+    pub(super) rendition: RenditionSemantics,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -73,6 +83,10 @@ enum MetadataMetaField {
     BookType,
     OrientationLock,
     RenditionOrientation,
+    RenditionSpread,
+    RenditionFlow,
+    RenditionViewport,
+    RenditionAlign,
     OriginalResolution,
     PrimaryWritingMode,
 }
@@ -104,44 +118,24 @@ pub(super) fn parse_opf(xml: &[u8]) -> Result<ParsedOpf> {
     let mut reader = Reader::from_reader(Cursor::new(xml));
     reader.config_mut().trim_text(true);
     let mut buffer = Vec::new();
-    let mut metadata_field: Option<String> = None;
-    let mut metadata_text = String::new();
-    let mut metadata_meta_field: Option<MetadataMetaField> = None;
-    let mut metadata_meta_text = String::new();
+    let mut metadata_depth = 0usize;
+    let mut metadata_elements = Vec::new();
     loop {
         match reader.read_event_into(&mut buffer)? {
             Event::Start(event) => {
                 let name = local_name(event.name().as_ref());
-                match name.as_str() {
-                    "metadata" => {}
-                    "title" | "creator" | "language" | "identifier" | "publisher"
-                    | "description" => {
-                        metadata_field = Some(name);
-                        metadata_text.clear();
-                    }
-                    "meta" => {
-                        metadata_meta_field = metadata_meta_kind(&event);
-                        metadata_meta_text.clear();
-                        if let Some(value) = attr(&event, "content") {
-                            if let Some(field) = metadata_meta_field {
-                                apply_metadata_meta(&mut result, field, &value);
-                            }
-                            metadata_meta_field = None;
-                        }
-                    }
-                    "manifest" | "item" | "spine" | "itemref" => {
-                        parse_opf_start(&event, &mut result);
-                    }
-                    _ => {}
+                if name == "metadata" {
+                    metadata_depth += 1;
+                } else if metadata_depth > 0 && is_metadata_element(&name) {
+                    metadata_elements.push(MetadataElement::from_start(&event, name));
+                } else {
+                    parse_opf_start(&event, &mut result);
                 }
             }
             Event::Empty(event) => {
-                if local_name(event.name().as_ref()) == "meta" {
-                    if let (Some(field), Some(value)) =
-                        (metadata_meta_kind(&event), attr(&event, "content"))
-                    {
-                        apply_metadata_meta(&mut result, field, &value);
-                    }
+                let name = local_name(event.name().as_ref());
+                if metadata_depth > 0 && is_metadata_element(&name) {
+                    apply_metadata_element(&mut result, MetadataElement::from_empty(&event, name));
                 } else {
                     parse_opf_start(&event, &mut result);
                 }
@@ -150,32 +144,29 @@ pub(super) fn parse_opf(xml: &[u8]) -> Result<ParsedOpf> {
                 let text = event
                     .unescape()
                     .map_err(|error| Error::Xml(error.to_string()))?;
-                if metadata_meta_field.is_some() {
-                    metadata_meta_text.push_str(&text);
-                } else if metadata_field.is_some() {
-                    metadata_text.push_str(&text);
+                if let Some(element) = metadata_elements.last_mut() {
+                    element.text.push_str(&text);
+                }
+            }
+            Event::CData(event) => {
+                if let Some(element) = metadata_elements.last_mut() {
+                    element
+                        .text
+                        .push_str(&String::from_utf8_lossy(event.as_ref()));
                 }
             }
             Event::End(event) => {
                 let name = local_name(event.name().as_ref());
-                if name == "meta" {
-                    if let Some(field) = metadata_meta_field.take() {
-                        apply_metadata_meta(&mut result, field, &metadata_meta_text);
+                if metadata_depth > 0 && name == "metadata" {
+                    metadata_depth = metadata_depth.saturating_sub(1);
+                } else if metadata_elements
+                    .last()
+                    .is_some_and(|element| element.name == name)
+                {
+                    if let Some(element) = metadata_elements.pop() {
+                        apply_metadata_element(&mut result, element);
                     }
                 }
-                if let Some(field) = metadata_field.take() {
-                    let value = metadata_text.trim().to_owned();
-                    match field.as_str() {
-                        "title" => result.metadata.title = Some(value),
-                        "creator" => result.metadata.creator = Some(value),
-                        "language" => result.metadata.language = Some(value),
-                        "identifier" => result.metadata.identifier = Some(value),
-                        "publisher" => result.metadata.publisher = Some(value),
-                        "description" => result.metadata.description = Some(value),
-                        _ => {}
-                    }
-                }
-                let _ = name;
             }
             Event::Eof => break,
             _ => {}
@@ -191,8 +182,235 @@ pub(super) fn parse_opf(xml: &[u8]) -> Result<ParsedOpf> {
     for spine_item in &mut result.spine {
         spine_item.layout = SpineLayout::from_itemref_properties(&spine_item.properties)
             .unwrap_or(publication_layout);
+        spine_item.rendition = rendition_from_properties(&spine_item.properties)?;
     }
+    result.rendition = rendition_from_metadata(&result.metadata)?;
+    finalize_metadata(&mut result.metadata);
     Ok(result)
+}
+
+#[derive(Debug, Clone)]
+struct MetadataElement {
+    name: String,
+    id: Option<String>,
+    property: Option<String>,
+    refines: Option<String>,
+    scheme: Option<String>,
+    content: Option<String>,
+    legacy_kind: Option<MetadataMetaField>,
+    text: String,
+}
+
+impl MetadataElement {
+    fn from_start(event: &BytesStart<'_>, name: String) -> Self {
+        Self {
+            name: name.clone(),
+            id: attr(event, "id"),
+            property: attr(event, "property"),
+            refines: attr(event, "refines").map(|value| normalize_refines(&value)),
+            scheme: attr(event, "scheme"),
+            content: attr(event, "content"),
+            legacy_kind: (name == "meta")
+                .then(|| metadata_meta_kind(event))
+                .flatten(),
+            text: String::new(),
+        }
+    }
+
+    fn from_empty(event: &BytesStart<'_>, name: String) -> Self {
+        Self::from_start(event, name)
+    }
+}
+
+fn is_metadata_element(name: &str) -> bool {
+    matches!(
+        name,
+        "title"
+            | "creator"
+            | "language"
+            | "identifier"
+            | "publisher"
+            | "description"
+            | "contributor"
+            | "meta"
+            | "collection"
+    )
+}
+
+fn normalize_refines(value: &str) -> String {
+    value.trim().trim_start_matches('#').to_owned()
+}
+
+fn apply_metadata_element(result: &mut ParsedOpf, element: MetadataElement) {
+    let value = element
+        .content
+        .as_deref()
+        .unwrap_or(element.text.trim())
+        .trim()
+        .to_owned();
+    if value.is_empty() {
+        return;
+    }
+    if element.name == "meta" {
+        if let Some(field) = element.legacy_kind {
+            apply_metadata_meta(result, field, &value);
+        }
+    }
+    let property = element
+        .property
+        .or_else(|| (element.name != "meta").then_some(element.name.clone()))
+        .unwrap_or_default();
+    if property.is_empty() {
+        return;
+    }
+    result.metadata.records.push(MetadataRecord {
+        id: element.id,
+        property,
+        refines: element.refines,
+        scheme: element.scheme,
+        value,
+    });
+}
+
+fn property_matches(property: &str, wanted: &str) -> bool {
+    property
+        .rsplit(':')
+        .next()
+        .is_some_and(|value| value.eq_ignore_ascii_case(wanted))
+}
+
+fn refined_value<'a>(
+    records: &'a [MetadataRecord],
+    target: &str,
+    property: &str,
+) -> Option<&'a str> {
+    records
+        .iter()
+        .find(|record| {
+            record.refines.as_deref() == Some(target)
+                && property_matches(&record.property, property)
+        })
+        .map(|record| record.value.as_str())
+}
+
+fn finalize_metadata(metadata: &mut Metadata) {
+    let records = metadata.records.clone();
+    let titles = records
+        .iter()
+        .filter(|record| property_matches(&record.property, "title") && record.refines.is_none())
+        .collect::<Vec<_>>();
+    let main_title = titles
+        .iter()
+        .find(|record| {
+            record.id.as_deref().is_some_and(|id| {
+                refined_value(&records, id, "title-type")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("main"))
+            })
+        })
+        .or_else(|| titles.first());
+    metadata.title = main_title.map(|record| record.value.clone());
+    metadata.title_file_as = main_title.and_then(|record| {
+        record
+            .id
+            .as_deref()
+            .and_then(|id| refined_value(&records, id, "file-as"))
+            .map(str::to_owned)
+    });
+
+    let creator_records = records
+        .iter()
+        .filter(|record| property_matches(&record.property, "creator") && record.refines.is_none())
+        .collect::<Vec<_>>();
+    metadata.creators = creator_records
+        .iter()
+        .map(|record| CreatorMetadata {
+            value: record.value.clone(),
+            role: record
+                .id
+                .as_deref()
+                .and_then(|id| refined_value(&records, id, "role").map(str::to_owned)),
+        })
+        .collect();
+    let first_author = metadata.creators.iter().find(|creator| {
+        creator.role.as_deref().is_none_or(|role| {
+            role.eq_ignore_ascii_case("aut") || role.eq_ignore_ascii_case("author")
+        })
+    });
+    metadata.creator = first_author
+        .or_else(|| metadata.creators.first())
+        .map(|creator| creator.value.clone());
+    metadata.creator_file_as = first_author.and_then(|creator| {
+        creator_records
+            .iter()
+            .find(|record| record.value == creator.value)
+            .and_then(|record| {
+                record
+                    .id
+                    .as_deref()
+                    .and_then(|id| refined_value(&records, id, "file-as"))
+                    .map(str::to_owned)
+            })
+    });
+    if let Some(publisher) = records
+        .iter()
+        .rev()
+        .find(|record| property_matches(&record.property, "publisher") && record.refines.is_none())
+    {
+        metadata.publisher = Some(publisher.value.clone());
+        metadata.publisher_file_as = publisher
+            .id
+            .as_deref()
+            .and_then(|id| refined_value(&records, id, "file-as").map(str::to_owned));
+    }
+    metadata.language = records
+        .iter()
+        .rev()
+        .find(|record| property_matches(&record.property, "language") && record.refines.is_none())
+        .map(|record| record.value.clone())
+        .or_else(|| metadata.language.clone());
+    metadata.identifier = records
+        .iter()
+        .rev()
+        .find(|record| property_matches(&record.property, "identifier") && record.refines.is_none())
+        .map(|record| record.value.clone())
+        .or_else(|| metadata.identifier.clone());
+    metadata.description = records
+        .iter()
+        .rev()
+        .find(|record| {
+            property_matches(&record.property, "description") && record.refines.is_none()
+        })
+        .map(|record| record.value.clone())
+        .or_else(|| metadata.description.clone());
+    metadata.contributors = records
+        .iter()
+        .filter(|record| {
+            property_matches(&record.property, "contributor") && record.refines.is_none()
+        })
+        .map(|record| record.value.clone())
+        .collect();
+
+    metadata.collection = records
+        .iter()
+        .filter(|record| {
+            property_matches(&record.property, "belongs-to-collection")
+                || property_matches(&record.property, "collection")
+        })
+        .map(|record| CollectionMetadata {
+            name: record.value.clone(),
+            collection_type: collection_refinement(&records, record, "collection-type"),
+            group_position: collection_refinement(&records, record, "group-position"),
+        })
+        .collect();
+}
+
+fn collection_refinement(
+    records: &[MetadataRecord],
+    collection: &MetadataRecord,
+    property: &str,
+) -> Option<String> {
+    let target = collection.refines.as_deref().or(collection.id.as_deref())?;
+    refined_value(records, target, property).map(str::to_owned)
 }
 
 fn metadata_meta_kind(event: &BytesStart<'_>) -> Option<MetadataMetaField> {
@@ -225,6 +443,34 @@ fn metadata_meta_kind(event: &BytesStart<'_>) -> Option<MetadataMetaField> {
             .any(|token| token.eq_ignore_ascii_case("rendition:orientation"))
     }) {
         return Some(MetadataMetaField::RenditionOrientation);
+    }
+    if attr(event, "property").as_deref().is_some_and(|value| {
+        value
+            .split_whitespace()
+            .any(|token| token.eq_ignore_ascii_case("rendition:spread"))
+    }) {
+        return Some(MetadataMetaField::RenditionSpread);
+    }
+    if attr(event, "property").as_deref().is_some_and(|value| {
+        value
+            .split_whitespace()
+            .any(|token| token.eq_ignore_ascii_case("rendition:flow"))
+    }) {
+        return Some(MetadataMetaField::RenditionFlow);
+    }
+    if attr(event, "property").as_deref().is_some_and(|value| {
+        value
+            .split_whitespace()
+            .any(|token| token.eq_ignore_ascii_case("rendition:viewport"))
+    }) {
+        return Some(MetadataMetaField::RenditionViewport);
+    }
+    if attr(event, "property").as_deref().is_some_and(|value| {
+        value
+            .split_whitespace()
+            .any(|token| token.eq_ignore_ascii_case("rendition:align-x"))
+    }) {
+        return Some(MetadataMetaField::RenditionAlign);
     }
     match name.as_deref().map(str::to_ascii_lowercase).as_deref() {
         Some("book-type") => Some(MetadataMetaField::BookType),
@@ -264,6 +510,18 @@ fn apply_metadata_meta(result: &mut ParsedOpf, field: MetadataMetaField, value: 
         MetadataMetaField::RenditionOrientation => {
             result.metadata.orientation = Some(value.to_owned());
         }
+        MetadataMetaField::RenditionSpread => {
+            result.metadata.spread = Some(value.to_owned());
+        }
+        MetadataMetaField::RenditionFlow => {
+            result.metadata.flow = Some(value.to_owned());
+        }
+        MetadataMetaField::RenditionViewport => {
+            result.metadata.rendition_viewport = Some(value.to_owned());
+        }
+        MetadataMetaField::RenditionAlign => {
+            result.metadata.align_x = Some(value.to_owned());
+        }
         MetadataMetaField::OriginalResolution => {
             result.metadata.original_resolution = Some(value.to_owned());
         }
@@ -286,6 +544,9 @@ fn apply_metadata_meta(result: &mut ParsedOpf, field: MetadataMetaField, value: 
 
 fn parse_opf_start(event: &BytesStart<'_>, result: &mut ParsedOpf) {
     match local_name(event.name().as_ref()).as_str() {
+        "package" => {
+            result.unique_identifier_id = attr(event, "unique-identifier");
+        }
         "item" => {
             let Some(id) = attr(event, "id") else { return };
             let Some(href) = attr(event, "href") else {
@@ -299,11 +560,15 @@ fn parse_opf_start(event: &BytesStart<'_>, result: &mut ParsedOpf) {
                 .split_whitespace()
                 .map(str::to_owned)
                 .collect();
+            let fallback = attr(event, "fallback");
+            let media_overlay = attr(event, "media-overlay");
             let item = ManifestItem {
                 id: id.clone(),
                 href,
                 media_type,
                 properties,
+                fallback,
+                media_overlay,
             };
             if item
                 .media_type
@@ -327,7 +592,9 @@ fn parse_opf_start(event: &BytesStart<'_>, result: &mut ParsedOpf) {
                     idref,
                     linear,
                     properties,
+                    media_overlay: attr(event, "media-overlay"),
                     layout: SpineLayout::default(),
+                    rendition: RenditionSemantics::default(),
                 });
             }
         }
@@ -341,6 +608,95 @@ fn parse_opf_start(event: &BytesStart<'_>, result: &mut ParsedOpf) {
             }
         }
         _ => {}
+    }
+}
+
+fn rendition_from_metadata(metadata: &Metadata) -> Result<RenditionSemantics> {
+    Ok(RenditionSemantics {
+        orientation: metadata
+            .orientation
+            .as_deref()
+            .map(parse_orientation)
+            .transpose()?,
+        spread: metadata.spread.as_deref().map(parse_spread).transpose()?,
+        flow: metadata.flow.as_deref().map(parse_flow).transpose()?,
+        align_x: metadata.align_x.as_deref().map(parse_align).transpose()?,
+        page_spread: None,
+    })
+}
+
+fn rendition_from_properties(properties: &[String]) -> Result<RenditionSemantics> {
+    let mut result = RenditionSemantics::default();
+    for property in properties {
+        let normalized = property.to_ascii_lowercase();
+        if let Some(value) = normalized.strip_prefix("rendition:orientation-") {
+            result.orientation = Some(parse_orientation(value)?);
+        } else if let Some(value) = normalized.strip_prefix("rendition:spread-") {
+            result.spread = Some(parse_spread(value)?);
+        } else if let Some(value) = normalized.strip_prefix("rendition:flow-") {
+            result.flow = Some(parse_flow(value)?);
+        } else if let Some(value) = normalized.strip_prefix("rendition:align-x-") {
+            result.align_x = Some(parse_align(value)?);
+        } else if normalized == "page-spread-left"
+            || normalized == "rendition:page-spread-left"
+            || normalized == "facing-page-left"
+        {
+            result.page_spread = Some(PageSpread::Left);
+        } else if normalized == "page-spread-right"
+            || normalized == "rendition:page-spread-right"
+            || normalized == "facing-page-right"
+        {
+            result.page_spread = Some(PageSpread::Right);
+        } else if normalized == "page-spread-center" || normalized == "rendition:page-spread-center"
+        {
+            result.page_spread = Some(PageSpread::Center);
+        }
+    }
+    Ok(result)
+}
+
+fn parse_orientation(value: &str) -> Result<RenditionOrientation> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(RenditionOrientation::Auto),
+        "portrait" => Ok(RenditionOrientation::Portrait),
+        "landscape" => Ok(RenditionOrientation::Landscape),
+        value => Err(Error::UnsupportedEpub(format!(
+            "unsupported rendition:orientation value {value}"
+        ))),
+    }
+}
+
+fn parse_spread(value: &str) -> Result<RenditionSpread> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(RenditionSpread::Auto),
+        "none" => Ok(RenditionSpread::None),
+        "landscape" => Ok(RenditionSpread::Landscape),
+        "portrait" => Ok(RenditionSpread::Portrait),
+        "both" => Ok(RenditionSpread::Both),
+        value => Err(Error::UnsupportedEpub(format!(
+            "unsupported rendition:spread value {value}"
+        ))),
+    }
+}
+
+fn parse_flow(value: &str) -> Result<RenditionFlow> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(RenditionFlow::Auto),
+        "paginated" => Ok(RenditionFlow::Paginated),
+        "scrolled-continuous" => Ok(RenditionFlow::ScrolledContinuous),
+        "scrolled-doc" => Ok(RenditionFlow::ScrolledDoc),
+        value => Err(Error::UnsupportedEpub(format!(
+            "unsupported rendition:flow value {value}"
+        ))),
+    }
+}
+
+fn parse_align(value: &str) -> Result<RenditionAlign> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "center" => Ok(RenditionAlign::Center),
+        value => Err(Error::UnsupportedEpub(format!(
+            "unsupported rendition:align-x value {value}"
+        ))),
     }
 }
 

@@ -347,6 +347,13 @@ fn flatten_ncx_nodes(items: &[KindleNavigationItem]) -> Vec<NcxNode> {
         output: &mut Vec<NcxNode>,
     ) {
         for item in items {
+            if item.href.is_empty() {
+                // An unlinked EPUB navigation heading remains visible in the
+                // synthetic TOC, but it has no KF8 position target. Keep its
+                // descendants without inventing a link for the heading.
+                visit(&item.children, depth, parent, output);
+                continue;
+            }
             let index = output.len();
             output.push(NcxNode {
                 label: item.label.clone(),
@@ -373,7 +380,9 @@ fn flatten_ncx_nodes(items: &[KindleNavigationItem]) -> Vec<NcxNode> {
 
 fn flatten(items: &[KindleNavigationItem], output: &mut Vec<(String, String)>) {
     for item in items {
-        output.push((plain_display_text(&item.label), item.href.clone()));
+        if !item.href.is_empty() {
+            output.push((plain_display_text(&item.label), item.href.clone()));
+        }
         flatten(&item.children, output);
     }
 }

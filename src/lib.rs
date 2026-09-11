@@ -11,6 +11,7 @@
 mod api;
 mod book;
 mod container;
+mod css;
 mod epub;
 mod error;
 mod kf8;

@@ -1,3 +1,5 @@
+//! Public API / CLI contract evidence; this test is outside A-F audit ownership.
+
 use std::path::PathBuf;
 use std::process::Command;
 
