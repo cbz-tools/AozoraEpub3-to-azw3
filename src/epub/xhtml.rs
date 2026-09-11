@@ -272,11 +272,12 @@ pub(super) fn reject_scripting_and_media_playback(source: &str) -> Result<()> {
             } else {
                 scripting_skip_until.max(tag.end + 1)
             };
-            if scripting_body_start < style_body_end
-                && let Some(skip_until) =
+            if scripting_body_start < style_body_end {
+                if let Some(skip_until) =
                     scan_scripting_style_body(source, scripting_body_start, style_body_end)?
-            {
-                scripting_skip_until = skip_until;
+                {
+                    scripting_skip_until = skip_until;
+                }
             }
             cursor = style_raw_end;
             continue;
@@ -496,12 +497,12 @@ pub(super) fn reject_unsupported_srcset(source: &str) -> Result<()> {
                     "img" | "source"
                 ) =>
             {
-                if let Some(srcset) = attr(&event, "srcset")
-                    && srcset_has_package_local_candidate(&srcset)
-                {
-                    return Err(Error::UnsupportedEpub(
-                        "G3-19 picture/source srcset with package-local candidate is unsupported by the KF8 projection".to_owned(),
-                    ));
+                if let Some(srcset) = attr(&event, "srcset") {
+                    if srcset_has_package_local_candidate(&srcset) {
+                        return Err(Error::UnsupportedEpub(
+                            "G3-19 picture/source srcset with package-local candidate is unsupported by the KF8 projection".to_owned(),
+                        ));
+                    }
                 }
             }
             Event::Eof => break,

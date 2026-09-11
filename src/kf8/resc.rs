@@ -66,11 +66,11 @@ pub(crate) fn encode(
     for (_, skelid, section) in entries {
         xml.push_str("<itemref idref=\"");
         push_xml_attribute(&mut xml, &section.id);
-        xml.push_str("\"");
+        xml.push('"');
         if !section.source_properties.is_empty() {
             xml.push_str(" properties=\"");
             push_xml_attribute(&mut xml, &section.source_properties.join(" "));
-            xml.push_str("\"");
+            xml.push('"');
         }
         xml.push_str(" skelid=\"");
         xml.push_str(&skelid.to_string());

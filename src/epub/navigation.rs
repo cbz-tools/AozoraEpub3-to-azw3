@@ -164,10 +164,10 @@ pub(super) fn parse_nav_xhtml(xml: &[u8]) -> Result<Navigation> {
                 }
             }
             Event::End(event) if local_name(event.name().as_ref()) == "span" => {
-                if let Some(heading) = current_unlinked_span.take()
-                    && let Some((item, _)) = list_items.last_mut()
-                {
-                    item.label = plain_display_text(&heading);
+                if let Some(heading) = current_unlinked_span.take() {
+                    if let Some((item, _)) = list_items.last_mut() {
+                        item.label = plain_display_text(&heading);
+                    }
                 }
             }
             Event::End(event) if local_name(event.name().as_ref()) == "a" => {

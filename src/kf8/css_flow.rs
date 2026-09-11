@@ -80,7 +80,7 @@ impl<'a> ResourceIndex<'a> {
     pub(crate) fn any_css(
         &self,
         normalized_href: &str,
-        mut predicate: impl FnMut(&Resource) -> bool,
+        predicate: impl FnMut(&Resource) -> bool,
     ) -> bool {
         self.by_href
             .get(normalized_href)
@@ -88,7 +88,7 @@ impl<'a> ResourceIndex<'a> {
             .flatten()
             .filter_map(|&index| self.resources.get(index))
             .filter(|resource| is_css_resource(resource))
-            .any(|resource| predicate(resource))
+            .any(predicate)
     }
 
     fn resource_reference(&self, base_href: &str, target: &str) -> Option<String> {

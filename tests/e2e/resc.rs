@@ -211,21 +211,20 @@ fn resc_projects_publication_rendition_and_itemref_overrides() {
 fn publication_orientation_survives_mixed_and_reflowable_layouts() {
     // Audit coverage: G6-04. Publication orientation is independent of
     // publication layout and is retained in both RESC and EXTH 124.
-    for (layout, orientation, expected, item_properties) in [(
+    let (layout, orientation, expected, item_properties) = (
         r#"<meta property="rendition:layout">reflowable</meta>"#,
         "portrait",
         "portrait",
         "",
-    )] {
-        let azw3 = convert_epub(orientation_recipe(layout, orientation, item_properties));
-        assert_eq!(azw3.exth().text(124).as_deref(), Some(expected));
-        let resc = parse_resc(&azw3);
-        assert!(
-            resc.metadata
-                .contains(&("rendition:orientation".to_owned(), expected.to_owned(),)),
-            "RESC retains publication orientation for {expected}"
-        );
-    }
+    );
+    let azw3 = convert_epub(orientation_recipe(layout, orientation, item_properties));
+    assert_eq!(azw3.exth().text(124).as_deref(), Some(expected));
+    let resc = parse_resc(&azw3);
+    assert!(
+        resc.metadata
+            .contains(&("rendition:orientation".to_owned(), expected.to_owned(),)),
+        "RESC retains publication orientation for {expected}"
+    );
 
     let mixed = convert_epub(mixed_orientation_recipe());
     assert_eq!(mixed.exth().text(124).as_deref(), Some("landscape"));

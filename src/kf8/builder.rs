@@ -243,7 +243,7 @@ fn project_style_and_resources(
         let source = rewrite_stylesheet_links_with_references(
             source,
             &section.href,
-            &css_resources,
+            css_resources,
             Some(&section.referenced_styles),
         );
         let source = if layout_rewrite.uses_generated_layout {
@@ -255,12 +255,8 @@ fn project_style_and_resources(
         } else {
             source
         };
-        let source = rewrite_projected_attributes(
-            source,
-            &section.href,
-            cover_resource_id,
-            &resource_index,
-        )?;
+        let source =
+            rewrite_projected_attributes(source, &section.href, cover_resource_id, resource_index)?;
         projected.push(KindleSection {
             id: section.id,
             href: section.href,
@@ -344,17 +340,17 @@ fn prepare_link_materialization(
     css_resources: &super::css_flow::CssResourceIndex<'_>,
 ) -> Result<Vec<Vec<PendingInternalLink>>> {
     let mut pending_links = Vec::with_capacity(sections.len());
-    for section_number in 0..sections.len() {
-        let source = std::mem::take(&mut sections[section_number].source_xhtml);
+    for (section_number, section) in sections.iter_mut().enumerate() {
+        let source = std::mem::take(&mut section.source_xhtml);
         let (source, links) = rewrite_internal_links(
             source,
-            &sections[section_number].href,
+            &section.href,
             section_lookup,
             section_number,
             anchor_indices,
             css_resources,
         )?;
-        sections[section_number].source_xhtml = source;
+        section.source_xhtml = source;
         pending_links.push(links);
     }
     Ok(pending_links)
